@@ -50,7 +50,7 @@ For more info and documentaion on how to code in Nova look at the [wiki](https:/
 
 - You can specify an icon with `set_icon("path/to/icon.ico)`, png support will be added soon.
 - PNG icons will be converted to ICO later on but for now it doesn't work and you need .ico's
-- Make sure the icon payh is correct relative to your `.nova` file.
+- Make sure the icon path is correct relative to your `.nova` file.
 
 ---
 
@@ -76,6 +76,7 @@ For questions or help, open an issue on the GitHub repo or reach out to me, Kerb
 
 
 Thank you for looking at or maybe even trying out Nova!
+
 
 
 
