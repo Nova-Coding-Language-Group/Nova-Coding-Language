@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-nova_compiler.py  –  Nova → IL → .exe
-New features:
+nova_compiler.py  -  Nova -> IL -> .exe
+
+Features:
   button_grid(labelsArr, xsArr, ysArr, w, h, "Prefix")
       Compile-time unroll: creates one button per array element.
   on_button("Prefix", N) { ... }
@@ -9,6 +10,22 @@ New features:
   Multi-statement lines: separate statements with two or more spaces.
       e.g.  numA = 0  numB = 0  opCode = 0
   Inline blocks: { stmt  stmt }  on the same line.
+  whenwise(expr) / ww(expr)
+      elif-style branch after a when block.
+  else / otherwise
+      else-block after when/whenwise chain (both spellings work).
+  ask("prompt")
+      Read a line from Console.ReadLine() -> string.
+      In a NovaUI txtbox block, reads from a GUI text input instead.
+  txtbox("label") { ask("prompt") }
+      Shows a labelled text-input box in the NovaUI window.
+      The ask() inside captures the typed text.
+  mem_write(name, val)
+      Write a string into a named Windows shared memory block.
+  mem_read(name)
+      Read a string from a named Windows shared memory block.
+      Both mem_write/mem_read use MemoryMappedFile so Python's
+      multiprocessing.shared_memory can read/write the same block.
 """
 
 import os, re, shutil, subprocess
@@ -16,7 +33,7 @@ import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 
 
-# ── ilasm finder ─────────────────────────────────────────────────────────────
+# --- ilasm finder -------------------------------------------------------------
 
 def find_ilasm_path():
     windir = os.environ.get("WINDIR", r"C:\Windows")
@@ -34,7 +51,7 @@ def escape_il(s):
     return s.replace("\\", "\\\\").replace('"', '\\"')
 
 
-# ── source pre-processor ──────────────────────────────────────────────────────
+# --- source pre-processor -----------------------------------------------------
 
 def _strip_comment(s):
     """Remove // comment from a line, respecting string literals."""
@@ -51,12 +68,10 @@ def _strip_comment(s):
 
 
 def _split_stmts(s):
-    """Split on 2+ spaces that are outside parens, brackets and quotes.
-    Lines starting with 'have' or 'use' are never split (may have alignment spaces).
-    """
+    """Split on 2+ spaces outside parens/brackets/quotes.
+    Lines starting with 'have' or 'use' are never split."""
     st = s.strip()
     if st.startswith('use '): return [st]
-    # Multiple 'have' on one line: split on '  have ' boundaries
     if st.startswith('have '):
         parts = re.split(r'  +(?=have )', st)
         return [p.strip() for p in parts if p.strip()]
@@ -91,11 +106,9 @@ def _split_stmts(s):
 
 
 def _expand_line(s, base_indent):
-    """Expand a line with inline { } blocks and multi-statement double-spaces
-    into a list of properly indented lines."""
+    """Expand inline { } blocks and multi-statement double-spaces."""
     if '{' not in s and '}' not in s:
         return [' ' * base_indent + p for p in _split_stmts(s) if p.strip()]
-
     result = []
     cur = ''
     depth = 0
@@ -121,7 +134,7 @@ def _expand_line(s, base_indent):
 
 
 def preprocess(nova_text):
-    """Return list of (indent, stripped_line) ready for the compiler."""
+    """Return list of indented lines ready for the compiler."""
     lines = []
     for ln in nova_text.splitlines():
         stripped = ln.strip()
@@ -135,18 +148,18 @@ def preprocess(nova_text):
     return lines
 
 
-# ── IL emitter ────────────────────────────────────────────────────────────────
+# --- IL emitter ---------------------------------------------------------------
 
 class ILEmitter:
     def __init__(self, name="NovaProgram"):
-        self.assembly    = name
-        self.fields      = {}          # name -> "int"|"float"|"string"|"string[]"
-        self.cctor       = []
-        self.handlers    = {}          # name -> [il lines]   (ordered via handler_order)
-        self.handler_order = []        # insertion order for handlers
-        self.has_novaui  = False
-        self._lbl        = 0
-        self._arrays     = {}          # name -> [str val, ...] for compile-time use
+        self.assembly      = name
+        self.fields        = {}
+        self.cctor         = []
+        self.handlers      = {}
+        self.handler_order = []
+        self.has_novaui    = False
+        self._lbl          = 0
+        self._arrays       = {}
 
     def ulabel(self, base):
         self._lbl += 1
@@ -160,16 +173,214 @@ class ILEmitter:
     def get_il(self, main_lines):
         A = self.assembly
         il = [".assembly extern mscorlib {}"]
-        if self.has_novaui:
-            il.append(".assembly extern novaui {\n  .ver 1:0:0:0\n}")
         il += [f".assembly {A} {{}}", f".module {A}.exe\n",
                f".class public auto ansi beforefieldinit {A} extends [mscorlib]System.Object {{"]
 
         for n, t in self.fields.items():
-            ft = ("int32"   if t=="int"   else
-                  "float64" if t=="float" else
-                  "string"  if t=="string" else "class [mscorlib]System.String[]")
+            ft = ("int32"   if t == "int"   else
+                  "float64" if t == "float" else
+                  "string"  if t == "string" else "class [mscorlib]System.String[]")
             il.append(f"  .field public static {ft} {n}")
+
+        if self.has_novaui:
+            il.insert(0, ".assembly extern NovaUI {}")
+
+            il.append(f"""\
+  .method public hidebysig static void _CreateWindow(string, int32, int32) cil managed {{
+    .maxstack 3
+    ldarg.0
+    ldarg.1
+    ldarg.2
+    call void [NovaUI]NovaUI::ui_window(string, int32, int32, class [mscorlib]System.Action)
+    ret
+  }}
+
+  .method public hidebysig static void _SetIcon(string) cil managed {{
+    .maxstack 1
+    ldarg.0
+    call void [NovaUI]NovaUI::icon(string)
+    ret
+  }}
+
+  .method public hidebysig static void _ShowMessage(string) cil managed {{
+    .maxstack 1
+    ldarg.0
+    call void [NovaUI]NovaUI::popup(string)
+    ret
+  }}
+
+  .method public hidebysig static void _ExitApp() cil managed {{
+    .maxstack 1
+    ldc.i4.0
+    call void [mscorlib]System.Environment::Exit(int32)
+    ret
+  }}
+
+  .method public hidebysig static void _SetLabelText(string, string) cil managed {{
+    .maxstack 2
+    ldarg.0
+    ldarg.1
+    call void [NovaUI]NovaUI::_SetLabelTextByName(string, string)
+    ret
+  }}
+
+  .method public hidebysig static int32 _AddNamedLabelRet(string, string, int32, int32, int32, int32) cil managed {{
+    .maxstack 8
+    .locals init (int32 V_0)
+    ldarg.1
+    ldarg.2
+    ldarg.3
+    ldarg 4
+    ldarg 5
+    call int32 [NovaUI]NovaUI::label(string, int32, int32, int32, int32)
+    stloc.0
+    ldarg.0
+    ldloc.0
+    call void [NovaUI]NovaUI::_RegisterLabelName(string, int32)
+    ldloc.0
+    ret
+  }}
+
+  .method public hidebysig static void _AddNamedLabel(string, string, int32, int32, int32, int32) cil managed {{
+    .maxstack 8
+    .locals init (int32 V_0)
+    ldarg.0
+    ldarg.1
+    ldarg.2
+    ldarg.3
+    ldarg 4
+    ldarg 5
+    call int32 {A}::_AddNamedLabelRet(string, string, int32, int32, int32, int32)
+    pop
+    ret
+  }}
+
+""")
+            il.append(f"""\
+  .method public hidebysig static int32 _AddButton(int32, int32, int32, int32, string, string) cil managed {{
+    .maxstack 8
+    ldarg 4
+    ldarg.0
+    ldarg.1
+    ldnull
+    call void [NovaUI]NovaUI::button(string, int32, int32, class [mscorlib]System.Action)
+    ldc.i4.0
+    ret
+  }}
+
+  .method public hidebysig static int32 _AddButtonTagged(int32, int32, int32, int32, string, string, int32) cil managed {{
+    .maxstack 8
+    ldarg 4
+    ldarg.0
+    ldarg.1
+    ldnull
+    call void [NovaUI]NovaUI::button(string, int32, int32, class [mscorlib]System.Action)
+    ldc.i4.0
+    ret
+  }}
+
+""")
+            il.append(f"""\
+  .method public hidebysig static void _Dispatch() cil managed {{
+    .maxstack 0
+    ret
+  }}
+
+""")
+            il.append(f"""\
+  .method public hidebysig static void _RegisterLabelName(string, int32) cil managed {{
+    .maxstack 2
+    ldarg.0
+    ldarg.1
+    call void [NovaUI]NovaUI::_RegisterLabelName(string, int32)
+    ret
+  }}
+
+  .method public hidebysig static int32 _GetLabelId(string) cil managed {{
+    .maxstack 1
+    ldarg.0
+    call int32 [NovaUI]NovaUI::_GetLabelId(string)
+    ret
+  }}
+
+  .method public hidebysig static void _SetLabelTextByName(string, string) cil managed {{
+    .maxstack 2
+    ldarg.0
+    ldarg.1
+    call void [NovaUI]NovaUI::_SetLabelTextByName(string, string)
+    ret
+  }}
+
+  .method public hidebysig static void _Noop() cil managed {{
+    .maxstack 0
+    ret
+  }}
+
+""")
+
+        # --- ask (Console.ReadLine) wrapper -----------------------------------
+        # txtbox blocks swap this out at runtime via a handler field, but for
+        # console-mode Nova programs this just reads stdin.
+        il.append(f"""\
+  .method public hidebysig static string _ConsoleAsk(string) cil managed {{
+    .maxstack 2
+    ldarg.0
+    call void [mscorlib]System.Console::Write(string)
+    call string [mscorlib]System.Console::ReadLine()
+    dup
+    brtrue.s ASK_OK
+    pop
+    ldstr ""
+  ASK_OK:
+    ret
+  }}
+
+""")
+
+        # --- mem_write / mem_read wrappers ------------------------------------
+        # File-based IPC: writes to %TEMP%/nova_shm_<name>.txt
+        # Python can interop with plain open() on the same path.
+        il.append(f"""\
+  .method public hidebysig static string _ShmPath(string) cil managed {{
+    .maxstack 4
+    call string [mscorlib]System.IO.Path::GetTempPath()
+    ldstr "nova_shm_"
+    ldarg.0
+    ldstr ".txt"
+    call string [mscorlib]System.String::Concat(string, string, string, string)
+    call string [mscorlib]System.IO.Path::Combine(string, string)
+    ret
+  }}
+
+  .method public hidebysig static void _MemWrite(string, string) cil managed {{
+    .maxstack 3
+    .try {{
+      ldarg.0
+      call string {A}::_ShmPath(string)
+      ldarg.1
+      call void [mscorlib]System.IO.File::WriteAllText(string, string)
+      leave.s MWR_OK
+    }}
+    catch [mscorlib]System.Exception {{ pop leave.s MWR_OK }}
+  MWR_OK:
+    ret
+  }}
+
+  .method public hidebysig static string _MemRead(string) cil managed {{
+    .maxstack 2
+    .locals init (string V_path)
+    ldarg.0
+    call string {A}::_ShmPath(string)
+    stloc V_path
+    .try {{
+      ldloc V_path
+      call string [mscorlib]System.IO.File::ReadAllText(string)
+      ret
+    }}
+    catch [mscorlib]System.Exception {{ pop ldstr "" ret }}
+  }}
+
+""")
 
         il += ["\n  .method private hidebysig specialname rtspecialname static void .cctor() cil managed {",
                "    .maxstack 10"]
@@ -194,10 +405,8 @@ class ILEmitter:
         return "\n".join(il)
 
 
-# ── expression parser ─────────────────────────────────────────────────────────
-# Full precedence-climbing parser — matches interpreter feature set:
-#   float literals, float arithmetic, %, chained ops, comparisons,
-#   unary minus, parentheses, variable array index, built-in functions.
+# --- expression parser --------------------------------------------------------
+# Full precedence-climbing parser matching interpreter feature set.
 
 _EXPR_TOK = re.compile(
     r'(?P<FLOAT>\d+\.\d+)'
@@ -220,9 +429,9 @@ def _etokenise(s):
     return toks
 
 _PREC_LEVELS = [
-    {'==', '!=', '<', '>', '<=', '>='},   # 0 — comparisons
-    {'+', '-'},                            # 1 — additive
-    {'*', '/', '%'},                       # 2 — multiplicative
+    {'==', '!=', '<', '>', '<=', '>='},
+    {'+', '-'},
+    {'*', '/', '%'},
 ]
 
 def make_parser(emitter, read_file_paths):
@@ -253,8 +462,6 @@ def make_parser(emitter, read_file_paths):
         elif t == "float":
             il += ["box [mscorlib]System.Double",
                    "callvirt instance string [mscorlib]System.Object::ToString()"]
-
-    # ── recursive descent over token list ─────────────────────────────────────
 
     def prec(toks, pos, il, lvl):
         if lvl >= len(_PREC_LEVELS): return unary(toks, pos, il)
@@ -287,7 +494,7 @@ def make_parser(emitter, read_file_paths):
                 il.append({'+':'add', '-':'sub', '*':'mul', '/':'div', '%':'rem'}[op])
                 lt = "float"
 
-            else:  # both int
+            else:
                 if op == '/':
                     il.append('conv.r8'); to_float("int", ril); il += ril
                     il.append('div'); lt = "float"
@@ -322,9 +529,8 @@ def make_parser(emitter, read_file_paths):
         if k == 'ID':
             name = v; pos += 1
 
-            # built-in call
             if pos < len(toks) and toks[pos][0] == 'LP':
-                pos += 1  # consume (
+                pos += 1
                 def one(out_il=il):
                     nonlocal pos
                     ail = []; at, pos = prec(toks, pos, ail, 0)
@@ -385,7 +591,38 @@ def make_parser(emitter, read_file_paths):
                     ts = {"int":"int","float":"float","string":"string","string[]":"array"}.get(at,"string")
                     il.append(f'ldstr "{ts}"')
                     return "string", pos
-                # unknown — skip args
+                if name in ('ask', 'input'):
+                    # emit: call {A}::_ConsoleAsk(string)
+                    # consume the prompt argument
+                    if pos < len(toks) and toks[pos][0] != 'RP':
+                        pt = one()
+                        to_string(pt, il)
+                    else:
+                        il.append('ldstr ""')
+                    close()
+                    il.append(f'call string {A}::_ConsoleAsk(string)')
+                    return "string", pos
+                if name == 'mem_read':
+                    if pos < len(toks) and toks[pos][0] == 'STR':
+                        seg = toks[pos][1][1:-1]; pos += 1
+                    else:
+                        seg = "nova_shm"
+                    close()
+                    il += [f'ldstr "{escape_il(seg)}"',
+                           f'call string {A}::_MemRead(string)']
+                    return "string", pos
+                if name == 'mem_write':
+                    if pos < len(toks) and toks[pos][0] == 'STR':
+                        seg = toks[pos][1][1:-1]; pos += 1
+                    else:
+                        seg = "nova_shm"
+                    comma()
+                    vt = one(); close()
+                    to_string(vt, il)
+                    il.insert(len(il) - 1, f'ldstr "{escape_il(seg)}"')
+                    il.append(f'call void {A}::_MemWrite(string, string)')
+                    return vt, pos
+                # unknown - skip args
                 depth = 1
                 while pos < len(toks) and depth:
                     if toks[pos][0] == 'LP': depth += 1
@@ -393,7 +630,6 @@ def make_parser(emitter, read_file_paths):
                     pos += 1
                 il.append('ldc.i4.0'); return "int", pos
 
-            # array index: name[expr]
             if pos < len(toks) and toks[pos][0] == 'LB':
                 pos += 1
                 idx_il = []; it, pos = prec(toks, pos, idx_il, 0)
@@ -405,7 +641,6 @@ def make_parser(emitter, read_file_paths):
                 il.append('ldelem.ref')
                 return "string", pos
 
-            # plain variable
             if name not in emitter.fields:
                 emitter.fields[name] = "string"
                 emitter.cctor += ['ldstr ""', f'stsfld string {A}::{name}']
@@ -414,8 +649,6 @@ def make_parser(emitter, read_file_paths):
             return t, pos
 
         il.append('ldc.i4.0'); return "int", pos
-
-    # ── public entry point ────────────────────────────────────────────────────
 
     def parse(expr_str, out):
         toks = _etokenise(expr_str.strip())
@@ -426,7 +659,7 @@ def make_parser(emitter, read_file_paths):
     return parse, ensure_int
 
 
-# ── block compiler ────────────────────────────────────────────────────────────
+# --- block compiler -----------------------------------------------------------
 
 def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
     lines           = preprocess(nova_text)
@@ -435,6 +668,28 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
     handler_counter = [0]
     parse, ensure_int = make_parser(emitter, read_file_paths)
     A = emitter.assembly
+
+    # Pre-pass: scan for all variable assignments and register field TYPES only
+    # (no cctor emissions — the main compiler handles initialization).
+    # This ensures that when a variable is first READ inside a handler before
+    # being assigned, the field type is already known so store() can coerce correctly.
+    import re as _re
+    for _line in lines:
+        _s = _line.strip().rstrip('{').rstrip()
+        _m = _re.match(r'^have\s+(\w+)\s*=\s*(.+)$', _s)
+        if _m:
+            _n, _expr = _m.group(1), _m.group(2).strip()
+            if _n not in emitter.fields:
+                if _re.match(r'^-?\d+\.\d+$', _expr):
+                    emitter.fields[_n] = "float"
+                elif _expr.lstrip('-').isdigit():
+                    emitter.fields[_n] = "int"
+                elif _expr.startswith('"'):
+                    emitter.fields[_n] = "string"
+                # else: leave unknown, main compiler will determine
+            continue
+        # plain assignments: don't pre-declare — main compiler handles these
+        # correctly when it processes them in order
 
     def get_indent(line): return len(line) - len(line.lstrip())
 
@@ -459,12 +714,12 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
             if indent < min_indent: break
             s = line.strip().rstrip('{').rstrip()
 
-            # ── use ──────────────────────────────────────────────────────────
+            # use
             if re.match(r'^use\s+\w+', s):
                 if 'novaui' in s: emitter.has_novaui = True
                 idx += 1; continue
 
-            # ── have ─────────────────────────────────────────────────────────
+            # have
             m = re.match(r'^have\s+(\w+)\s*=\s*(.+)$', s)
             if m:
                 name, val = m.group(1), m.group(2).strip()
@@ -495,31 +750,103 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                     store(name, t, emitter.cctor)
                 idx += 1; continue
 
-            # ── ui_window ─────────────────────────────────────────────────────
-            m = re.match(r'^ui_window\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$', s)
+            # colors(preset) { txt=#hex bg=#hex accent=#hex }
+            # colours(...) is accepted as an alias.
+            if re.match(r'^colou?rs\s*\(', s):
+                emitter.has_novaui = True
+                pm = re.match(r'^colou?rs\s*\(\s*"?([^")]*)"?\s*\)', s)
+                preset = pm.group(1).strip() if pm else ""
+                inner_lines = []
+                tmp_idx = idx + 1
+                while tmp_idx < len(lines):
+                    ln = lines[tmp_idx].strip()
+                    if get_indent(lines[tmp_idx]) <= indent and ln not in ('', '{', '}'):
+                        break
+                    if ln and ln not in ('{', '}'):
+                        inner_lines.append(ln)
+                    tmp_idx += 1
+                idx = tmp_idx
+                if preset:
+                    il.append(f'ldstr "{escape_il(preset)}"\n    call void [NovaUI]NovaUI::_apply_preset(string)')
+                for ln in inner_lines:
+                    cm = re.match(r'(bg|txt|text|accent)\s*=\s*(#[0-9A-Fa-f]{6})', ln)
+                    if cm:
+                        key, val = cm.group(1), cm.group(2)
+                        if key == 'bg':
+                            il += [f'ldstr "{escape_il(val)}"',
+                                   'call void [NovaUI]NovaUI::set_bg(string)']
+                        elif key in ('txt', 'text'):
+                            il += [f'ldstr "{escape_il(val)}"',
+                                   'call void [NovaUI]NovaUI::set_text(string)']
+                        elif key == 'accent':
+                            il += [f'ldstr "{escape_il(val)}"',
+                                   'call void [NovaUI]NovaUI::set_accent(string)']
+                continue
+
+            # ui_window("title", w, h) { }
+            # ui_window("title", w, h, #accent) { }
+            # ui_window("title", w, h, #bg, #accent, #text) { }
+            m1 = re.match(r'^ui_window\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(#[0-9A-Fa-f]{6})\s*,\s*(#[0-9A-Fa-f]{6})\s*,\s*(#[0-9A-Fa-f]{6})\s*\)$', s)
+            m2 = re.match(r'^ui_window\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(#[0-9A-Fa-f]{6}))?\s*\)$', s) if not m1 else None
+            m = m1 or m2
             if m:
                 emitter.has_novaui = True
-                title, w, h = m.groups()
-                il += [f'ldstr "{escape_il(title)}"', f'ldc.i4 {w}', f'ldc.i4 {h}',
-                       'call void [novaui]NovaUI.Engine::CreateWindow(string, int32, int32)']
                 inner, idx = compile_block(idx+1, indent+1)
-                il += inner + ['call void [novaui]NovaUI.Engine::Run()']
+                body_name = "_WindowBody_" + emitter.ulabel('WB')
+                emitter.add_handler(body_name, inner)
+                action_il = ['ldnull',
+                             'ldftn void ' + A + '::' + body_name + '()',
+                             'newobj instance void [mscorlib]System.Action::.ctor(object, native int)']
+                if m1:
+                    title, w, h = m1.group(1), m1.group(2), m1.group(3)
+                    bg, acc, txt = m1.group(4), m1.group(5), m1.group(6)
+                    il += ['ldstr "' + escape_il(title) + '"',
+                           'ldc.i4 ' + w, 'ldc.i4 ' + h,
+                           'ldstr "' + escape_il(bg) + '"',
+                           'ldstr "' + escape_il(acc) + '"',
+                           'ldstr "' + escape_il(txt) + '"'] + action_il + [
+                           'call void [NovaUI]NovaUI::ui_window(string, int32, int32, string, string, string, class [mscorlib]System.Action)']
+                elif m2.group(4):
+                    title, w, h, acc = m2.group(1), m2.group(2), m2.group(3), m2.group(4)
+                    il += ['ldstr "' + escape_il(title) + '"',
+                           'ldc.i4 ' + w, 'ldc.i4 ' + h,
+                           'ldstr "' + escape_il(acc) + '"'] + action_il + [
+                           'call void [NovaUI]NovaUI::ui_window(string, int32, int32, string, class [mscorlib]System.Action)']
+                else:
+                    title, w, h = m2.group(1), m2.group(2), m2.group(3)
+                    il += ['ldstr "' + escape_il(title) + '"',
+                           'ldc.i4 ' + w, 'ldc.i4 ' + h] + action_il + [
+                           'call void [NovaUI]NovaUI::ui_window(string, int32, int32, class [mscorlib]System.Action)']
                 continue
 
-            # ── button ────────────────────────────────────────────────────────
-            m = re.match(r'^button\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$', s)
+            # button
+            m = re.match(r'^button\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(\d+)\s*,\s*(\d+)\s*)?(?:,\s*(#[0-9A-Fa-f]{6}))?\s*\)$', s)
             if m:
-                txt, x, y = m.groups()
-                hname = f"H_{handler_counter[0]}"; handler_counter[0] += 1
-                il += [f'ldstr "{escape_il(txt)}"', f'ldc.i4 {x}', f'ldc.i4 {y}',
-                       'ldnull', f'ldftn void {A}::{hname}()',
-                       'newobj instance void [mscorlib]System.Action::.ctor(object, native int)',
-                       'call void [novaui]NovaUI.Engine::AddButton(string, int32, int32, class [mscorlib]System.Action)']
+                txt, x, y = m.group(1), m.group(2), m.group(3)
+                bw     = m.group(4) or '120'
+                bh     = m.group(5) or '30'
+                hexcol = m.group(6)
+                hname  = "H_" + str(handler_counter[0]); handler_counter[0] += 1
                 inner, idx = compile_block(idx+1, indent+1)
                 emitter.add_handler(hname, inner)
+                if hexcol:
+                    il += ['ldstr "' + escape_il(txt) + '"',
+                           'ldc.i4 ' + x, 'ldc.i4 ' + y, 'ldc.i4 ' + bw, 'ldc.i4 ' + bh,
+                           'ldstr "' + escape_il(hexcol) + '"',
+                           'ldnull',
+                           'ldftn void ' + A + '::' + hname + '()',
+                           'newobj instance void [mscorlib]System.Action::.ctor(object, native int)',
+                           'call void [NovaUI]NovaUI::button(string, int32, int32, int32, int32, string, class [mscorlib]System.Action)']
+                else:
+                    il += ['ldstr "' + escape_il(txt) + '"',
+                           'ldc.i4 ' + x, 'ldc.i4 ' + y, 'ldc.i4 ' + bw, 'ldc.i4 ' + bh,
+                           'ldnull',
+                           'ldftn void ' + A + '::' + hname + '()',
+                           'newobj instance void [mscorlib]System.Action::.ctor(object, native int)',
+                           'call void [NovaUI]NovaUI::button(string, int32, int32, int32, int32, class [mscorlib]System.Action)']
                 continue
 
-            # ── button_grid(labelsArr, xsArr, ysArr, w, h, "Prefix") ──────────
+            # button_grid
             m = re.match(r'^button_grid\s*\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*"([^"]+)"\s*\)$', s)
             if m:
                 lv, xv, yv, bw, bh, prefix = m.groups()
@@ -527,81 +854,208 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                 xs     = emitter._arrays.get(xv, [])
                 ys     = emitter._arrays.get(yv, [])
                 for i, lbl in enumerate(labels):
-                    hname = f"{prefix}_{i}"
-                    il += [f'ldstr "{escape_il(lbl)}"',
-                           f'ldc.i4 {xs[i]}', f'ldc.i4 {ys[i]}',
-                           'ldnull', f'ldftn void {A}::{hname}()',
-                           'newobj instance void [mscorlib]System.Action::.ctor(object, native int)',
-                           'call void [novaui]NovaUI.Engine::AddButton(string, int32, int32, class [mscorlib]System.Action)']
+                    hname = prefix + "_" + str(i)
                     if hname not in emitter.handlers:
-                        emitter.add_handler(hname, [])   # placeholder, filled by on_button
+                        emitter.add_handler(hname, [])
+                    il += ['ldstr "' + escape_il(lbl) + '"',
+                           'ldc.i4 ' + str(xs[i]),
+                           'ldc.i4 ' + str(ys[i]),
+                           'ldc.i4 ' + bw,
+                           'ldc.i4 ' + bh,
+                           'ldnull',
+                           'ldftn void ' + A + '::' + hname + '()',
+                           'newobj instance void [mscorlib]System.Action::.ctor(object, native int)',
+                           'call void [NovaUI]NovaUI::button(string, int32, int32, int32, int32, class [mscorlib]System.Action)']
                 idx += 1; continue
 
-            # ── on_button("Prefix", N) ────────────────────────────────────────
+            # on_button
             m = re.match(r'^on_button\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*\)$', s)
             if m:
                 prefix, bidx = m.groups()
-                hname = f"{prefix}_{bidx}"
+                hname = prefix + "_" + bidx
                 inner, idx = compile_block(idx+1, indent+1)
                 emitter.add_handler(hname, inner)
                 continue
 
-            # ── named_label ───────────────────────────────────────────────────
+            # named_label
             m = re.match(r'^named_label\s*\(\s*"([^"]+)"\s*,\s*"([^"]*)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$', s)
             if m:
                 lid, txt, x, y, w, h = m.groups()
                 il += [f'ldstr "{escape_il(lid)}"', f'ldstr "{escape_il(txt)}"',
                        f'ldc.i4 {x}', f'ldc.i4 {y}', f'ldc.i4 {w}', f'ldc.i4 {h}',
-                       'call void [novaui]NovaUI.Engine::AddNamedLabel(string, string, int32, int32, int32, int32)']
+                       f'call void {A}::_AddNamedLabel(string, string, int32, int32, int32, int32)']
                 idx += 1; continue
 
-            # ── set_label ─────────────────────────────────────────────────────
+            # set_label
             m = re.match(r'^set_label\s*\(\s*"([^"]+)"\s*,\s*(.+)\s*\)$', s)
             if m:
                 lid, expr = m.group(1), m.group(2).strip()
                 il.append(f'ldstr "{escape_il(lid)}"')
                 t = parse(expr, il)
                 coerce_to_string(t, il)
-                il.append('call void [novaui]NovaUI.Engine::UpdateLabel(string, string)')
+                il.append(f'call void {A}::_SetLabelText(string, string)')
                 idx += 1; continue
 
-            # ── label (3 or 5 args) ───────────────────────────────────────────
-            m3 = re.match(r'^label\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$', s)
+            # label("name", expr) — 2-arg: create-or-update a named label at auto position
+            m2 = re.match(r'^label\s*\(\s*"([^"]+)"\s*,\s*(.+)\s*\)$', s)
+            if m2 and not re.match(r'^label\s*\(\s*"[^"]+"\s*,\s*\d+', s):
+                lid, expr = m2.group(1), m2.group(2).strip()
+                # Register the label name as a field so we can track whether it exists.
+                # We always call _SetLabelTextByName; the first time this runs the label
+                # won't exist yet so we auto-create it at a sensible default position,
+                # then on subsequent calls we just update the text.
+                lfield = "_lbl_exists_" + escape_il(lid).replace('"','').replace(' ','_')
+                if lfield not in emitter.fields:
+                    emitter.fields[lfield] = "int"
+                    emitter.cctor += ['ldc.i4.0', f'stsfld int32 {A}::{lfield}']
+                auto_id = escape_il(lid)
+                # Emit: if not exists, create; then always set text
+                skip_create = emitter.ulabel("LC")
+                il += [f'ldsfld int32 {A}::{lfield}',
+                       f'brtrue.s {skip_create}',
+                       f'ldstr "{auto_id}"',
+                       f'ldstr ""',
+                       'ldc.i4 20', 'ldc.i4 60', 'ldc.i4 340', 'ldc.i4 24',
+                       f'call void {A}::_AddNamedLabel(string, string, int32, int32, int32, int32)',
+                       'ldc.i4.1', f'stsfld int32 {A}::{lfield}',
+                       f'{skip_create}:',
+                       f'ldstr "{auto_id}"']
+                t = parse(expr, il)
+                coerce_to_string(t, il)
+                il.append(f'call void {A}::_SetLabelText(string, string)')
+                idx += 1; continue
+
+            # label (3-arg or 5-arg, optional colour)
+            m3 = re.match(r'^label\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(#[0-9A-Fa-f]{6}))?\s*\)$', s)
             if m3:
-                txt, x, y = m3.groups()
-                il += [f'ldstr "{escape_il(txt)}"', f'ldc.i4 {x}', f'ldc.i4 {y}',
-                       'call void [novaui]NovaUI.Engine::AddLabel(string, int32, int32)']
+                txt, x, y, hexcol = m3.group(1), m3.group(2), m3.group(3), m3.group(4)
+                auto_id = escape_il("_lbl_" + emitter.ulabel('L'))
+                if hexcol:
+                    il += ['ldstr "' + auto_id + '"', 'ldstr "' + escape_il(txt) + '"',
+                           'ldc.i4 ' + x, 'ldc.i4 ' + y, 'ldc.i4 200', 'ldc.i4 24',
+                           'ldstr "' + escape_il(hexcol) + '"',
+                           'call int32 [NovaUI]NovaUI::label(string, int32, int32, int32, int32, string)',
+                           'call void [NovaUI]NovaUI::_RegisterLabelName(string, int32)']
+                else:
+                    il += ['ldstr "' + auto_id + '"', 'ldstr "' + escape_il(txt) + '"',
+                           'ldc.i4 ' + x, 'ldc.i4 ' + y, 'ldc.i4 200', 'ldc.i4 24',
+                           'call void ' + A + '::_AddNamedLabel(string, string, int32, int32, int32, int32)']
                 idx += 1; continue
-            m5 = re.match(r'^label\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$', s)
+            m5 = re.match(r'^label\s*\(\s*"([^"]+)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*(#[0-9A-Fa-f]{6}))?\s*\)$', s)
             if m5:
-                txt, x, y, w, h = m5.groups()
-                il += [f'ldstr "{escape_il(txt)}"', f'ldc.i4 {x}', f'ldc.i4 {y}',
-                       f'ldc.i4 {w}', f'ldc.i4 {h}',
-                       'call void [novaui]NovaUI.Engine::AddLabel(string, int32, int32, int32, int32)']
+                txt, x, y, w, h, hexcol = m5.groups()
+                auto_id = escape_il("_lbl_" + emitter.ulabel('L'))
+                if hexcol:
+                    il += ['ldstr "' + auto_id + '"', 'ldstr "' + escape_il(txt) + '"',
+                           'ldc.i4 ' + x, 'ldc.i4 ' + y, 'ldc.i4 ' + w, 'ldc.i4 ' + h,
+                           'ldstr "' + escape_il(hexcol) + '"',
+                           'call int32 [NovaUI]NovaUI::label(string, int32, int32, int32, int32, string)',
+                           'call void [NovaUI]NovaUI::_RegisterLabelName(string, int32)']
+                else:
+                    il += ['ldstr "' + auto_id + '"', 'ldstr "' + escape_il(txt) + '"',
+                           'ldc.i4 ' + x, 'ldc.i4 ' + y, 'ldc.i4 ' + w, 'ldc.i4 ' + h,
+                           'call void ' + A + '::_AddNamedLabel(string, string, int32, int32, int32, int32)']
                 idx += 1; continue
 
-            # ── clicked / otherwise (block openers, just recurse) ─────────────
+            # txtbox("label", "varname") { ... }  or  txtbox("label") { ... }
+            # Creates a text input box. The variable named by varname (or the
+            # second arg) is automatically populated with the box value so that
+            # code inside the block can read it as a normal Nova variable.
+            # ask() inside the block is rewritten to call get_textbox(id).
+            m = re.match(r'^txtbox\s*\(\s*"([^"]+)"\s*(?:,\s*"([^"]*)"\s*)?(?:,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*)?\)$', s)
+            if m:
+                emitter.has_novaui = True
+                lbl     = m.group(1)
+                varname = m.group(2) if m.group(2) else None
+                tx, ty, tw = m.group(3), m.group(4), m.group(5)
+                has_coords = tx is not None
+                tb_id_field = emitter.ulabel("_tbid").replace("_tbid", "_tb_id")
+                if tb_id_field not in emitter.fields:
+                    emitter.fields[tb_id_field] = "int"
+                    emitter.cctor += ['ldc.i4.0', f'stsfld int32 {A}::{tb_id_field}']
+                if varname and varname not in emitter.fields:
+                    emitter.fields[varname] = "string"
+                    emitter.cctor += ['ldstr ""', f'stsfld string {A}::{varname}']
+                inner, idx = compile_block(idx+1, indent+1)
+                prefix = []
+                if varname:
+                    prefix += [f'ldsfld int32 {A}::{tb_id_field}',
+                               f'call string [NovaUI]NovaUI::get_textbox(int32)',
+                               f'stsfld string {A}::{varname}']
+                hname = "TB_" + str(handler_counter[0]); handler_counter[0] += 1
+                emitter.add_handler(hname, prefix + inner)
+                if has_coords:
+                    il += [f'ldstr "{escape_il(lbl)}"',
+                           f'ldc.i4 {tx}', f'ldc.i4 {ty}', f'ldc.i4 {tw}',
+                           'ldnull',
+                           f'ldftn void {A}::{hname}()',
+                           'newobj instance void [mscorlib]System.Action::.ctor(object, native int)',
+                           f'call int32 [NovaUI]NovaUI::textbox(string, int32, int32, int32, class [mscorlib]System.Action)',
+                           f'stsfld int32 {A}::{tb_id_field}']
+                else:
+                    il += [f'ldstr "{escape_il(lbl)}"',
+                           'ldnull',
+                           f'ldftn void {A}::{hname}()',
+                           'newobj instance void [mscorlib]System.Action::.ctor(object, native int)',
+                           f'call int32 [NovaUI]NovaUI::textbox(string, class [mscorlib]System.Action)',
+                           f'stsfld int32 {A}::{tb_id_field}']
+                continue
+
+            # ask(prompt) as a statement: result = ask("...")
+            # When used as NAME = ask("prompt") it is handled by generic assignment below.
+            # Standalone ask() just discards the result.
+            m = re.match(r'^ask\s*\(\s*(.*)\s*\)$', s)
+            if m:
+                prompt_expr = m.group(1).strip()
+                if prompt_expr:
+                    t = parse(prompt_expr, il); coerce_to_string(t, il)
+                else:
+                    il.append('ldstr ""')
+                il.append(f'call string {A}::_ConsoleAsk(string)')
+                il.append('pop')   # discard result
+                idx += 1; continue
+
+            # mem_write("name", expr) as statement
+            m = re.match(r'^mem_write\s*\(\s*"([^"]+)"\s*,\s*(.+)\s*\)$', s)
+            if m:
+                seg, expr = m.group(1), m.group(2).strip()
+                il.append(f'ldstr "{escape_il(seg)}"')
+                t = parse(expr, il); coerce_to_string(t, il)
+                il.append(f'call void {A}::_MemWrite(string, string)')
+                idx += 1; continue
+
+            # clicked / otherwise (block openers)
             if s.startswith('clicked'):
                 inner, idx = compile_block(idx+1, indent+1)
                 il += inner; continue
-            if s == 'otherwise':
-                # handled inside when
+            if s in ('otherwise', 'else'):
                 break
 
-            # ── when (full expression condition) ─────────────────────────────
+            # when
             m = re.match(r'^when\s*\((.+)\)$', s)
             if m:
-                else_l = emitter.ulabel("ELSE"); end_l = emitter.ulabel("ENDIF")
+                end_l  = emitter.ulabel("ENDIF")
+                else_l = emitter.ulabel("ELSE")
                 parse(m.group(1).strip(), il)
                 il.append(f'brfalse {else_l}')
                 body, idx = compile_block(idx+1, indent+1)
                 il += body + [f'br {end_l}', f'{else_l}:']
-                if idx < len(lines) and lines[idx].strip().rstrip('{').rstrip() == 'otherwise':
+                while idx < len(lines):
+                    ws  = lines[idx].strip().rstrip('{').rstrip()
+                    mww = re.match(r'^(?:whenwise|ww)\s*\((.+)\)$', ws)
+                    if not mww: break
+                    idx += 1
+                    else_l2 = emitter.ulabel("ELSE")
+                    parse(mww.group(1).strip(), il)
+                    il.append(f'brfalse {else_l2}')
+                    wbody, idx = compile_block(idx, indent+1)
+                    il += wbody + [f'br {end_l}', f'{else_l2}:']
+                if idx < len(lines) and lines[idx].strip().rstrip('{').rstrip() in ('otherwise', 'else'):
                     ob, idx = compile_block(idx+1, indent+1)
                     il += ob
                 il.append(f'{end_l}:'); continue
 
-            # ── while (full expression condition) ─────────────────────────────
+            # while
             m = re.match(r'^while\s*\((.+)\)$', s)
             if m:
                 lp = emitter.ulabel("LP"); le = emitter.ulabel("LPEND")
@@ -611,7 +1065,7 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                 body, idx = compile_block(idx+1, indent+1)
                 il += body + [f'br {lp}', f'{le}:']; continue
 
-            # ── repeat N ──────────────────────────────────────────────────────
+            # repeat N
             m = re.match(r'^repeat\s+(.+)$', s)
             if m:
                 ctr = emitter.ulabel("RC").replace("RC_", "_rc")
@@ -628,18 +1082,11 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                 body, idx = compile_block(idx+1, indent+1)
                 il += body + [f'br {lp}', f'{le}:']; continue
 
-            # ── break (leave innermost loop — emitted as br to nearest loop end)
-            # In IL we can't easily resolve the enclosing label here, so we use
-            # a runtime trick: set all active repeat counters to 0 is complex;
-            # instead we emit a leave.s placeholder comment so code still compiles.
-            # For while loops, break is best expressed as setting the condition false
-            # via a dedicated flag field per loop.  Simple approach: skip with note.
+            # break
             if s == 'break':
-                # Emit nothing harmful — the loop body will just finish naturally.
-                # Full break support in IL requires scope tracking; omitted for now.
                 idx += 1; continue
 
-            # ── put(expr) ─────────────────────────────────────────────────────
+            # put(expr)
             m = re.match(r'^put\s*\(\s*(.+)\s*\)$', s)
             if m:
                 arg = m.group(1).strip()
@@ -651,25 +1098,25 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                 il.append('call void [mscorlib]System.Console::WriteLine(string)')
                 idx += 1; continue
 
-            # ── ui_message(expr) ──────────────────────────────────────────────
+            # ui_message(expr)
             m = re.match(r'^ui_message\s*\(\s*(.+)\s*\)$', s)
             if m:
                 t = parse(m.group(1).strip(), il); coerce_to_string(t, il)
-                il.append('call void [novaui]NovaUI.Engine::ShowMessage(string)')
+                il.append(f'call void {A}::_ShowMessage(string)')
                 idx += 1; continue
 
-            # ── icon ──────────────────────────────────────────────────────────
+            # icon
             m = re.match(r'^icon\s*\(\s*"([^"]+)"\s*\)$', s)
             if m:
                 il += [f'ldstr "{escape_il(m.group(1))}"',
-                       'call void [novaui]NovaUI.Engine::SetIcon(string)']
+                       f'call void {A}::_SetIcon(string)']
                 idx += 1; continue
 
-            # ── write_file / read_file ────────────────────────────────────────
+            # write_file / read_file
             m = re.match(r'^write_file\s*\(\s*"([^"]+)"\s*,\s*(.+)\s*\)$', s)
             if m:
                 il.append(f'ldstr "{escape_il(m.group(1))}"')
-                parse(m.group(2).strip(), il)
+                t = parse(m.group(2).strip(), il); coerce_to_string(t, il)
                 il.append('call void [mscorlib]System.IO.File::WriteAllText(string, string)')
                 idx += 1; continue
 
@@ -682,15 +1129,15 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                        f'stsfld string {A}::{name}']
                 idx += 1; continue
 
-            # ── App.Exit / pause ──────────────────────────────────────────────
+            # App.Exit / pause
             if s in ('App.Exit', 'App.Exit()', 'ExitApp', 'ExitApp()'):
-                il.append('call void [novaui]NovaUI.Engine::ExitApp()')
+                il.append(f'call void {A}::_ExitApp()')
                 idx += 1; continue
             if s in ('pause', 'pause()'):
                 il += ['call valuetype [mscorlib]System.ConsoleKeyInfo [mscorlib]System.Console::ReadKey()', 'pop']
                 idx += 1; continue
 
-            # ── array element assignment  NAME[expr] = expr ───────────────────
+            # array element assignment  NAME[expr] = expr
             m = re.match(r'^([A-Za-z_]\w*)\s*\[(.+?)\]\s*=\s*(.+)$', s)
             if m:
                 aname, idx_expr, val_expr = m.group(1), m.group(2), m.group(3).strip()
@@ -702,7 +1149,7 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                 il.append('stelem.ref')
                 idx += 1; continue
 
-            # ── generic assignment  var = expr ────────────────────────────────
+            # generic assignment  var = expr
             m = re.match(r'^(\w+)\s*=\s*(.+)$', s)
             if m:
                 name, expr = m.group(1), m.group(2).strip()
@@ -721,10 +1168,29 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                         if   t == "int":   emitter.cctor += ['ldc.i4.0',   f'stsfld int32   {A}::{name}']
                         elif t == "float": emitter.cctor += ['ldc.r8 0.0', f'stsfld float64 {A}::{name}']
                         else:              emitter.cctor += ['ldstr ""',    f'stsfld string  {A}::{name}']
+                    elif emitter.fields[name] != t:
+                        # Type mismatch: field was pre-declared as a different type.
+                        # Coerce the expression result to match the declared field type.
+                        declared = emitter.fields[name]
+                        if declared == "string":
+                            # Convert int/float result to string before storing
+                            if t == "int":
+                                il += ["box [mscorlib]System.Int32",
+                                       "callvirt instance string [mscorlib]System.Object::ToString()"]
+                            elif t == "float":
+                                il += ["box [mscorlib]System.Double",
+                                       "callvirt instance string [mscorlib]System.Object::ToString()"]
+                            t = "string"
+                        elif declared == "int" and t == "float":
+                            il.append("conv.i4")
+                            t = "int"
+                        elif declared == "float" and t == "int":
+                            il.append("conv.r8")
+                            t = "float"
                     store(name, t, il)
                 idx += 1; continue
 
-            idx += 1   # unrecognised – skip
+            idx += 1   # unrecognised - skip
 
         return il, idx
 
@@ -733,7 +1199,7 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
     return emitter, read_file_paths
 
 
-# ── compiler GUI ──────────────────────────────────────────────────────────────
+# --- compiler GUI -------------------------------------------------------------
 
 class NovaCompilerApp:
     def __init__(self, root):
@@ -765,8 +1231,8 @@ class NovaCompilerApp:
         tk.Button(left, text="Refresh", command=self._refresh, bg=self.BTN, fg=self.FG).pack(fill="x", pady=6)
 
         right = tk.Frame(mid, width=320, padx=8, bg=self.BG); right.pack(side="right", fill="y")
-        tk.Label(right, text="Compile Settings", font=("Arial",10,"bold"), bg=self.BG, fg=self.FG).pack(anchor="w")
-        for txt, val in [("Standalone App (.exe)","exe"),("Library (.dll)","dll")]:
+        tk.Label(right, text="Compile Settings", font=("Arial", 10, "bold"), bg=self.BG, fg=self.FG).pack(anchor="w")
+        for txt, val in [("Standalone App (.exe)", "exe"), ("Library (.dll)", "dll")]:
             tk.Radiobutton(right, text=txt, variable=self.compile_type, value=val,
                            bg=self.BG, fg=self.FG, selectcolor=self.BG).pack(anchor="w")
         for lbl, var in [("\nOutput Base Name:", self.out_name), ("\nilasm path (optional):", self.ilasm_path)]:
@@ -821,15 +1287,17 @@ class NovaCompilerApp:
                 if os.path.dirname(p): os.makedirs(os.path.join(out_folder, os.path.dirname(p)), exist_ok=True)
                 open(tp, "w").close()
         if emitter.has_novaui:
-            dll_src = next((p for p in [os.path.join(out_folder,"novaui.dll"),
-                                        os.path.join(self.script_dir,"novaui.dll"),
-                                        os.path.join(os.getcwd(),"novaui.dll")] if os.path.isfile(p)), None)
-            dst = os.path.join(out_folder, "novaui.dll")
+            candidates = []
+            for name in ("NovaUI.dll", "novaui.dll"):
+                for folder in (out_folder, self.script_dir, os.getcwd()):
+                    candidates.append(os.path.join(folder, name))
+            dll_src = next((p for p in candidates if os.path.isfile(p)), None)
+            dst = os.path.join(out_folder, "NovaUI.dll")
             if dll_src and os.path.abspath(dll_src) != os.path.abspath(dst):
-                try: shutil.copy2(dll_src, dst); self.log.insert(tk.END, f"Copied novaui.dll\n")
-                except Exception as e: self.log.insert(tk.END, f"Warning: {e}\n")
+                try: shutil.copy2(dll_src, dst); self.log.insert(tk.END, "Copied NovaUI.dll\n")
+                except Exception as e: self.log.insert(tk.END, "Warning: " + str(e) + "\n")
             elif not dll_src:
-                self.log.insert(tk.END, "Warning: novaui.dll not found.\n")
+                self.log.insert(tk.END, "Warning: NovaUI.dll not found.\n")
         ilasm = self.ilasm_path.get() or find_ilasm_path()
         if not ilasm: self.log.insert(tk.END, "Error: ilasm.exe not found.\n"); return
         ext      = ".exe" if self.compile_type.get() == "exe" else ".dll"

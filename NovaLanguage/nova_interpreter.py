@@ -1,50 +1,60 @@
 #!/usr/bin/env python3
 """
-nova_interpreter.py  —  Nova REPL + file runner
-================================================
-Complete feature parity with nova_compiler.py (minus .NET IL / GUI-only things).
+nova_interpreter.py  -  Nova interpreter (terminal only)
+=========================================================
+Run a .nova file:   python nova_interpreter.py my_script.nova
+Interactive REPL:   python nova_interpreter.py
+  Type Nova code, blank line to execute, Ctrl+C to exit.
 
 EXPRESSIONS
   int / float / string literals     42  3.14  "hello"
   variables                         x  myVar
-  arithmetic                        + - * /   (/ always true-division → float)
+  arithmetic                        + - * /   (/ always true-division -> float)
   modulo                            %
   chained ops                       a + b + c + d
-  comparisons → 0/1                 == != < > <= >=
+  comparisons -> 0/1                == != < > <= >=
   string concat                     "hi " + name
   unary minus                       -x  -3.14
   parentheses                       (a + b) * c
   array index                       arr[n]  (n = any expression)
   built-in calls                    len  int  float  str  abs  max  min  type
-                                    read_file  write_file  input  put
+                                    read_file  write_file  ask  put
+                                    mem_read  mem_write
 
 STATEMENTS
-  // comment          line comment
-  ; separator         same as newline
-  have x = expr       declare + assign  (arrays:  have x = ["a","b"])
-  x = expr            assign (auto-declare)
-  x[n] = expr         array element assign
-  put(expr)           print to output
-  when(expr){…}       if-block  (else = otherwise{…})
-  otherwise{…}        else-block (after when)
-  while(expr){…}      loop while truthy
-  repeat N {…}        loop exactly N times
-  break               exit innermost loop
-  write_file(p,expr)  write string to file
-  input(prompt)       read line from stdin → string
-  multi-stmt line     two-or-more spaces between statements
-  inline blocks       when(x){put(1)}otherwise{put(0)}  on one line
+  // comment           line comment
+  ; separator          same as newline
+  have x = expr        declare + assign  (arrays:  have x = ["a","b"])
+  x = expr             assign (auto-declare)
+  x[n] = expr          array element assign
+  put(expr)            print to output
+  ask(prompt)          read a line from stdin -> string
+  txtbox("label") {    print the label, then run the block (terminal: ask() reads stdin)
+      ask("prompt")        the ask() inside captures user input
+  }
+  mem_write(name, val) write val into named shared memory block
+  mem_read(name)       read string from named shared memory block
+  when(expr){...}      if-block
+  whenwise(expr){...}  elif-block (alias: ww)
+  ww(expr){...}        short alias for whenwise
+  otherwise{...}       else-block after when/whenwise  (alias: else)
+  else{...}            alias for otherwise
+  while(expr){...}     loop while truthy
+  repeat N {...}       loop exactly N times
+  break                exit innermost loop
+  write_file(p,expr)   write string to file
+  multi-stmt line      two-or-more spaces between statements
+  inline blocks        when(x){put(1)}otherwise{put(0)}  on one line
 """
 
 import re, sys, os
-import tkinter as tk
-from tkinter import scrolledtext, filedialog, messagebox
 
 
-# ─── tokeniser ────────────────────────────────────────────────────────────────
+
+# --- tokeniser ----------------------------------------------------------------
 
 TOKEN_SPEC = [
-    ('FLOAT',     r'\d+\.\d+'),        # must come before INT
+    ('FLOAT',     r'\d+\.\d+'),
     ('INT',       r'\d+'),
     ('STRING',    r'"[^"]*"'),
     ('ID',        r'[A-Za-z_]\w*'),
@@ -73,8 +83,7 @@ def tokenize(code):
     return toks
 
 
-# ─── preprocessor (multi-stmt + inline-block expander) ───────────────────────
-# Mirrors the compiler's preprocess() so .nova files behave identically.
+# --- preprocessor (multi-stmt + inline-block expander) -----------------------
 
 def _strip_comment(s):
     out, in_str = [], False
@@ -89,8 +98,6 @@ def _strip_comment(s):
     return ''.join(out).rstrip()
 
 def _split_stmts(s):
-    """Split on 2+ spaces or ; outside parens/brackets/quotes.
-    'use' lines are never split.  Multiple 'have' split on '  have' boundary."""
     st = s.strip()
     if st.startswith('use '): return [st]
     if st.startswith('have '):
@@ -143,7 +150,6 @@ def _expand_line(s, base_indent):
     return result
 
 def preprocess(source):
-    """Expand multi-stmt lines and inline blocks, strip comments."""
     lines = []
     for ln in source.splitlines():
         stripped = ln.strip()
@@ -155,19 +161,73 @@ def preprocess(source):
             if el.strip(): lines.append(el)
     return '\n'.join(lines)
 
+def _inject_braces(preprocessed_text):
+    lines = [ln for ln in preprocessed_text.splitlines() if ln.strip()]
+    if not lines:
+        return preprocessed_text
+    has_indent_blocks = any(
+        len(ln) - len(ln.lstrip()) > 0 and '{' not in ln and '}' not in ln
+        for ln in lines
+    )
+    if not has_indent_blocks:
+        return preprocessed_text
+    result = []
+    indent_stack = [0]
+    for ln in lines:
+        indent = len(ln) - len(ln.lstrip())
+        if indent > indent_stack[-1]:
+            if result:
+                result[-1] = result[-1].rstrip() + ' {'
+            indent_stack.append(indent)
+        else:
+            while len(indent_stack) > 1 and indent < indent_stack[-1]:
+                result.append(indent_stack[-1] * ' ' + '}')
+                indent_stack.pop()
+        result.append(ln)
+    while len(indent_stack) > 1:
+        result.append(indent_stack[-1] * ' ' + '}')
+        indent_stack.pop()
+    return '\n'.join(result)
 
-# ─── interpreter ─────────────────────────────────────────────────────────────
+
+# --- shared memory helpers ----------------------------------------------------
+
+def _shm_path(name):
+    """Return the temp-file path used for mem_read/mem_write IPC.
+    Matches the path the compiled Nova exe uses: TEMP/nova_shm_<name>.txt"""
+    import tempfile
+    return os.path.join(tempfile.gettempdir(), f"nova_shm_{name}.txt")
+
+def _mem_write(name, value):
+    """Write a string to the named IPC temp file."""
+    try:
+        with open(_shm_path(name), 'w', encoding='utf-8') as f:
+            f.write(str(value))
+    except Exception as e:
+        raise RuntimeError(f"mem_write failed: {e}")
+
+def _mem_read(name):
+    """Read a string from the named IPC temp file."""
+    try:
+        with open(_shm_path(name), 'r', encoding='utf-8') as f:
+            return f.read()
+    except Exception as e:
+        return f"ERROR:{e}"
+
+
+# --- interpreter --------------------------------------------------------------
 
 class BreakSignal(Exception): pass
 
 class NovaInterpreter:
-    def __init__(self, tokens, output_fn=None):
+    def __init__(self, tokens, output_fn=None, ask_fn=None):
         self.tokens = tokens
         self.pos    = 0
         self.vars   = {}
         self._out   = output_fn or (lambda s: print(s))
+        self._ask   = ask_fn    or (lambda p: input(p))
 
-    # ── token helpers ─────────────────────────────────────────────────────────
+    # -- token helpers ---------------------------------------------------------
 
     def peek(self, off=0):
         i = self.pos + off
@@ -189,7 +249,7 @@ class NovaInterpreter:
         if val is not None and t['val'] != val: return False
         return True
 
-    # ── top-level runner ──────────────────────────────────────────────────────
+    # -- runner ----------------------------------------------------------------
 
     def run_all(self):
         while self.pos < len(self.tokens):
@@ -199,10 +259,50 @@ class NovaInterpreter:
         t = self.peek()
         if not t or t['val'] == '}': return
 
-        # ── ; no-op ──────────────────────────────────────────────────────────
         if t['type'] == 'SEMI': self.eat(); return
 
-        # ── have NAME = rhs ──────────────────────────────────────────────────
+        # orphaned chain keywords - skip safely
+        if t['type'] == 'ID' and t['val'] in ('whenwise', 'ww', 'otherwise', 'else'):
+            self.eat()
+            if self.match('LPAREN'):
+                self.eat(); depth = 1
+                while self.pos < len(self.tokens) and depth:
+                    k = self.tokens[self.pos]['type']
+                    if k == 'LPAREN': depth += 1
+                    elif k == 'RPAREN': depth -= 1
+                    self.pos += 1
+            if self.match('LBRACE'): self._block()
+            return
+
+        # colors/colours block — just run the body, color state is visual-only
+        if t['type'] == 'ID' and t['val'] in ('colors', 'colours'):
+            self.eat(); self.eat('LPAREN')
+            preset = None
+            if not self.match('RPAREN'):
+                preset = self._display(self.expression())
+            self.eat('RPAREN')
+            body = self._block()
+            if preset:
+                self._out(f"[theme: {preset}]")
+            # parse body for key=value color assignments and store them
+            saved_tokens, saved_pos = self.tokens, self.pos
+            self.tokens, self.pos = body, 0
+            while self.pos < len(self.tokens):
+                ct = self.peek()
+                if not ct: break
+                if ct['type'] == 'ID' and self.pos + 2 < len(self.tokens):
+                    key = ct['val']
+                    if self.tokens[self.pos+1]['type'] == 'EQ':
+                        self.eat(); self.eat('EQ')
+                        val = self._display(self.expression())
+                        self.vars[f'_theme_{key}'] = val
+                    else:
+                        self.eat()
+                else:
+                    self.eat()
+            self.tokens, self.pos = saved_tokens, saved_pos
+            return
+
         if t['type'] == 'ID' and t['val'] == 'have':
             self.eat()
             name = self.eat('ID')['val']
@@ -210,17 +310,14 @@ class NovaInterpreter:
             self.vars[name] = self._rhs()
             return
 
-        # ── break ─────────────────────────────────────────────────────────────
         if t['type'] == 'ID' and t['val'] == 'break':
             self.eat(); raise BreakSignal()
 
-        # ── put(expr) ─────────────────────────────────────────────────────────
         if t['type'] == 'ID' and t['val'] == 'put':
             self.eat(); self.eat('LPAREN')
             self._out(self._display(self.expression()))
             self.eat('RPAREN'); return
 
-        # ── write_file("path", expr) ──────────────────────────────────────────
         if t['type'] == 'ID' and t['val'] == 'write_file':
             self.eat(); self.eat('LPAREN')
             path = self.eat('STRING')['val']; self.eat('COMMA')
@@ -228,18 +325,69 @@ class NovaInterpreter:
             with open(path, 'w', encoding='utf-8') as f: f.write(str(val))
             return
 
-        # ── when(expr){…} [otherwise{…}] ─────────────────────────────────────
-        if t['type'] == 'ID' and t['val'] == 'when':
+        if t['type'] == 'ID' and t['val'] == 'mem_write':
             self.eat(); self.eat('LPAREN')
-            cond = self.expression(); self.eat('RPAREN')
-            body  = self._block()
-            other = None
-            if self.match('ID', 'otherwise'): self.eat(); other = self._block()
-            if self._truthy(cond): self._exec_block(body)
-            elif other is not None: self._exec_block(other)
+            seg = self.eat('STRING')['val']; self.eat('COMMA')
+            val = self.expression(); self.eat('RPAREN')
+            try: _mem_write(seg, self._display(val))
+            except Exception as e: self._out(f"[mem_write error] {e}")
             return
 
-        # ── while(expr){…} ───────────────────────────────────────────────────
+        if t['type'] == 'ID' and t['val'] == 'label':
+            self.eat(); self.eat('LPAREN')
+            name = self.expression()
+            if self.match('COMMA'):
+                self.eat()
+                val = self._display(self.expression())
+                while self.match('COMMA'):
+                    self.eat(); self.expression()
+                self.eat('RPAREN')
+                key = f"_label_{name}"
+                self.vars[key] = val
+                self._out(f"[{name}] {val}")
+            else:
+                self.eat('RPAREN')
+            return
+
+        if t['type'] == 'ID' and t['val'] == 'txtbox':
+            self.eat(); self.eat('LPAREN')
+            lbl     = self._display(self.expression())
+            varname = None
+            if self.match('COMMA'):
+                self.eat()
+                nxt = self.peek()
+                if nxt and nxt['type'] == 'STRING':
+                    varname = self._display(self.expression())
+            while self.match('COMMA'):
+                self.eat(); self.expression()
+            self.eat('RPAREN')
+            body = self._block()
+            if lbl:
+                print(lbl)
+            if varname:
+                self.vars[varname] = self._ask(lbl + ": " if lbl else "")
+            self._exec_block(body)
+            return
+
+        if t['type'] == 'ID' and t['val'] == 'when':
+            self.eat(); self.eat('LPAREN')
+            cond_toks = self._collect_until('RPAREN'); self.eat('RPAREN')
+            body = self._block()
+            branches = [(cond_toks, body)]
+            while self.match('ID') and self.peek()['val'] in ('whenwise', 'ww'):
+                self.eat(); self.eat('LPAREN')
+                ec = self._collect_until('RPAREN'); self.eat('RPAREN')
+                eb = self._block()
+                branches.append((ec, eb))
+            other = None
+            if self.match('ID') and self.peek()['val'] in ('otherwise', 'else'):
+                self.eat(); other = self._block()
+            for bc, bb in branches:
+                if self._truthy(self._eval_tokens(bc)):
+                    self._exec_block(bb); return
+            if other is not None: self._exec_block(other)
+            return
+
         if t['type'] == 'ID' and t['val'] == 'while':
             self.eat(); self.eat('LPAREN')
             cond_toks = self._collect_until('RPAREN'); self.eat('RPAREN')
@@ -250,7 +398,6 @@ class NovaInterpreter:
                 except BreakSignal: break
             return
 
-        # ── repeat N {…} ─────────────────────────────────────────────────────
         if t['type'] == 'ID' and t['val'] == 'repeat':
             self.eat()
             n    = int(self._coerce_int(self.expression()))
@@ -260,11 +407,10 @@ class NovaInterpreter:
                 except BreakSignal: break
             return
 
-        # ── NAME[n] = val  or  NAME = val  or  standalone expr ───────────────
         if t['type'] == 'ID':
             name = t['val']
             nxt  = self.peek(1)
-            if nxt and nxt['type'] == 'LBRACK':          # NAME[n] = val
+            if nxt and nxt['type'] == 'LBRACK':
                 self.eat(); self.eat()
                 idx = self.expression(); self.eat('RBRACK'); self.eat('EQ')
                 val = self.expression()
@@ -274,17 +420,16 @@ class NovaInterpreter:
                     while len(arr) <= i: arr.append("")
                     arr[i] = val; self.vars[name] = arr
                 return
-            if nxt and nxt['type'] == 'EQ':               # NAME = val
+            if nxt and nxt['type'] == 'EQ':
                 self.eat(); self.eat()
                 self.vars[name] = self.expression(); return
-            self.expression(); return                      # standalone expr
+            self.expression(); return
 
-        self.expression()   # fallback
+        self.expression()
 
-    # ── block helpers ─────────────────────────────────────────────────────────
+    # -- block helpers ---------------------------------------------------------
 
     def _rhs(self):
-        """Array literal  [a, b, c]  or plain expression."""
         if self.match('LBRACK'):
             self.eat(); items = []
             while self.peek() and not self.match('RBRACK'):
@@ -293,8 +438,9 @@ class NovaInterpreter:
             self.eat('RBRACK'); return items
         return self.expression()
 
+    _BLOCK_TERMINATORS = {'whenwise', 'ww', 'otherwise', 'else'}
+
     def _block(self):
-        """Consume { … } and return the inner token slice."""
         self.eat('LBRACE'); start = self.pos; depth = 1
         while self.pos < len(self.tokens) and depth:
             k = self.tokens[self.pos]['type']
@@ -304,12 +450,12 @@ class NovaInterpreter:
         return self.tokens[start: self.pos - 1]
 
     def _exec_block(self, toks):
-        saved, self.tokens, self.pos = (self.pos, self.tokens), toks, 0
+        saved_tokens, saved_pos = self.tokens, self.pos
+        self.tokens, self.pos = toks, 0
         try: self.run_all()
-        finally: self.tokens, self.pos = saved
+        finally: self.tokens, self.pos = saved_tokens, saved_pos
 
     def _collect_until(self, stop_type):
-        """Collect tokens (respecting paren depth) until stop_type at depth 0."""
         toks = []; depth = 0
         while self.pos < len(self.tokens):
             t = self.tokens[self.pos]
@@ -321,17 +467,17 @@ class NovaInterpreter:
         return toks
 
     def _eval_tokens(self, toks):
-        """Evaluate a token list as an expression using shared vars."""
-        saved, self.tokens, self.pos = (self.pos, self.tokens), toks, 0
+        saved_tokens, saved_pos = self.tokens, self.pos
+        self.tokens, self.pos = toks, 0
         try: return self.expression()
-        finally: self.tokens, self.pos = saved
+        finally: self.tokens, self.pos = saved_tokens, saved_pos
 
-    # ── expression parser (precedence climbing) ───────────────────────────────
+    # -- expression parser -----------------------------------------------------
 
     _PREC = [
-        {'==', '!=', '<', '>', '<=', '>='},   # 0 comparison
-        {'+', '-'},                            # 1 additive
-        {'*', '/', '%'},                       # 2 multiplicative
+        {'==', '!=', '<', '>', '<=', '>='},
+        {'+', '-'},
+        {'*', '/', '%'},
     ]
 
     def expression(self):
@@ -366,12 +512,10 @@ class NovaInterpreter:
         if t['type'] == 'ID':
             name = t['val']; self.eat()
 
-            # ── built-in call ────────────────────────────────────────────────
             if self.match('LPAREN'):
                 self.eat()
-                # helpers
-                def _arg():  return self.expression()
-                def _arg2(): a = _arg(); self.eat('COMMA'); b = _arg(); return a, b
+                def _arg():   return self.expression()
+                def _arg2():  a = _arg(); self.eat('COMMA'); b = _arg(); return a, b
                 def _close(): self.eat('RPAREN')
 
                 if name == 'put':
@@ -381,9 +525,18 @@ class NovaInterpreter:
                     try:
                         with open(path, encoding='utf-8') as f: return f.read()
                     except Exception as e: return f"ERROR:{e}"
-                if name == 'input':
+                if name in ('ask', 'input'):
                     prompt = '' if self.match('RPAREN') else self._display(_arg())
-                    _close(); return input(prompt)
+                    _close(); return self._ask(prompt)
+                if name == 'mem_read':
+                    seg = self.eat('STRING')['val']; _close()
+                    return _mem_read(seg)
+                if name == 'mem_write':
+                    seg = self.eat('STRING')['val']; self.eat('COMMA')
+                    v = _arg(); _close()
+                    try: _mem_write(seg, self._display(v))
+                    except Exception as e: self._out(f"[mem_write error] {e}")
+                    return v
                 if name == 'len':
                     v = _arg(); _close()
                     return len(v) if isinstance(v, (str, list)) else 0
@@ -411,13 +564,11 @@ class NovaInterpreter:
                     v = _arg(); _close()
                     with open(path, 'w', encoding='utf-8') as f: f.write(str(v))
                     return v
-                # unknown — eat args, return 0
                 while not self.match('RPAREN') and self.peek():
                     _arg()
                     if self.match('COMMA'): self.eat()
                 _close(); return 0
 
-            # ── array index ──────────────────────────────────────────────────
             if self.match('LBRACK'):
                 self.eat(); idx = self.expression(); self.eat('RBRACK')
                 arr = self.vars.get(name, [])
@@ -426,11 +577,11 @@ class NovaInterpreter:
                     return arr[i] if 0 <= i < len(arr) else ""
                 return ""
 
-            return self.vars.get(name, 0)   # plain variable
+            return self.vars.get(name, 0)
 
         return 0
 
-    # ── operators ─────────────────────────────────────────────────────────────
+    # -- operators -------------------------------------------------------------
 
     def _op(self, op, l, r):
         if op == '+' and (isinstance(l, str) or isinstance(r, str)):
@@ -450,7 +601,7 @@ class NovaInterpreter:
         if op == '>=': return int(l >= r)
         return 0
 
-    # ── helpers ───────────────────────────────────────────────────────────────
+    # -- helpers ---------------------------------------------------------------
 
     def _truthy(self, v):
         if isinstance(v, (int, float)): return v != 0
@@ -472,120 +623,51 @@ class NovaInterpreter:
         except: return 0.0
 
 
-# ─── public runner ────────────────────────────────────────────────────────────
+# --- public runner ------------------------------------------------------------
 
-def run_nova(source, output_fn=None):
-    """Preprocess (expand multi-stmt / inline blocks) then interpret."""
+def run_nova(source, output_fn=None, ask_fn=None):
     expanded = preprocess(source)
-    tokens   = tokenize(expanded)
-    interp   = NovaInterpreter(tokens, output_fn)
+    braced   = _inject_braces(expanded)
+    tokens   = tokenize(braced)
+    interp   = NovaInterpreter(tokens, output_fn, ask_fn)
     interp.run_all()
     return interp
 
 
-# ─── terminal UI ─────────────────────────────────────────────────────────────
+# --- REPL ---------------------------------------------------------------------
 
-class NovaInterpreterApp:
-    def __init__(self, root):
-        self.root = root
-        root.title("Nova Interpreter")
-        root.geometry("820x580")
-        self.BG = "#0d0d0d"; self.FG = "#00ff88"
-        self.BTN = "#1a1a2e"; self.EBG = "#111111"
-        root.configure(bg=self.BG)
-        self._vars   = {}
-        self._history = []; self._hidx = 0
-
-        # toolbar
-        bar = tk.Frame(root, bg=self.BG, padx=6, pady=4); bar.pack(fill="x")
-        for label, cmd in [("Run File", self._run_file),
-                            ("Clear",    self._clear),
-                            ("Reset Vars", self._reset_vars)]:
-            tk.Button(bar, text=label, command=cmd,
-                      bg=self.BTN, fg=self.FG, relief="flat", padx=8).pack(side="left", padx=3)
-
-        # output area
-        self.terminal = scrolledtext.ScrolledText(
-            root, bg=self.BG, fg=self.FG, insertbackground=self.FG,
-            font=("Consolas", 11), relief="flat", borderwidth=0)
-        self.terminal.pack(fill="both", expand=True, padx=8, pady=(4, 0))
-        self._emit("Nova Interpreter  —  type Nova code and press Enter\n")
-
-        # input row
-        row = tk.Frame(root, bg=self.BG, padx=8, pady=6); row.pack(fill="x")
-        tk.Label(row, text="›", bg=self.BG, fg=self.FG,
-                 font=("Consolas", 13)).pack(side="left")
-        self.entry = tk.Entry(row, bg=self.EBG, fg=self.FG,
-                              insertbackground=self.FG, font=("Consolas", 11),
-                              relief="flat", borderwidth=4)
-        self.entry.pack(side="left", fill="x", expand=True, padx=6)
-        self.entry.bind("<Return>", self._run_line)
-        self.entry.bind("<Up>",     self._hist_up)
-        self.entry.bind("<Down>",   self._hist_down)
-        self.entry.focus_set()
-
-    def _emit(self, msg):
-        self.terminal.insert(tk.END, str(msg) + "\n")
-        self.terminal.see(tk.END)
-
-    def _run_line(self, _=None):
-        code = self.entry.get().strip()
-        if not code: return
-        self._history.append(code); self._hidx = len(self._history)
-        self.terminal.insert(tk.END, f"› {code}\n")
-        self.entry.delete(0, tk.END)
-        self._exec(code)
-
-    def _exec(self, code):
-        try:
-            expanded = preprocess(code)
-            tokens   = tokenize(expanded)
-            interp   = NovaInterpreter(tokens, self._emit)
-            interp.vars = self._vars
-            interp.run_all()
-            self._vars = interp.vars
-        except Exception as e:
-            self._emit(f"[Error] {e}")
-
-    def _run_file(self):
-        path = filedialog.askopenfilename(
-            title="Open .nova file",
-            filetypes=[("Nova files","*.nova"),("All","*.*")])
-        if not path: return
-        self._emit(f"\n── Running {os.path.basename(path)} ──")
-        try:
-            with open(path, encoding="utf-8") as f: src = f.read()
-            tokens = tokenize(preprocess(src))
-            interp = NovaInterpreter(tokens, self._emit)
-            interp.vars = dict(self._vars)
-            interp.run_all()
-        except Exception as e:
-            self._emit(f"[Error] {e}")
-        self._emit("── Done ──\n")
-
-    def _clear(self):       self.terminal.delete("1.0", tk.END)
-    def _reset_vars(self):  self._vars = {}; self._emit("[vars cleared]")
-
-    def _hist_up(self, _=None):
-        if self._hidx > 0:
-            self._hidx -= 1; self.entry.delete(0, tk.END)
-            self.entry.insert(0, self._history[self._hidx])
-
-    def _hist_down(self, _=None):
-        if self._hidx < len(self._history) - 1:
-            self._hidx += 1; self.entry.delete(0, tk.END)
-            self.entry.insert(0, self._history[self._hidx])
-        else:
-            self._hidx = len(self._history); self.entry.delete(0, tk.END)
+def _repl():
+    """Simple terminal REPL: type Nova code line by line."""
+    print("Nova Interpreter  -  type Nova code, blank line to run, Ctrl+C to exit")
+    vars_ = {}
+    buf   = []
+    try:
+        while True:
+            try:
+                line = input(">>> " if not buf else "... ")
+            except EOFError:
+                break
+            if line.strip() == "" and buf:
+                code = "\n".join(buf); buf = []
+                try:
+                    tokens = tokenize(_inject_braces(preprocess(code)))
+                    interp = NovaInterpreter(tokens)
+                    interp.vars = vars_
+                    interp.run_all()
+                    vars_ = interp.vars
+                except Exception as e:
+                    print(f"[Error] {e}")
+            elif line.strip():
+                buf.append(line)
+    except KeyboardInterrupt:
+        print()
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
+# --- entry point --------------------------------------------------------------
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         with open(sys.argv[1], encoding="utf-8") as f: src = f.read()
         run_nova(src)
     else:
-        root = tk.Tk()
-        NovaInterpreterApp(root)
-        root.mainloop()
+        _repl()
