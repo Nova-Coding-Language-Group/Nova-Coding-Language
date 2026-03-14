@@ -419,6 +419,13 @@ class NovaInterpreter:
                         delay_ms = int(maybe[0]['val'])
                         cond_toks = cond_toks[:i]
                     break
+            if delay_ms is None:
+                cond_str = ' '.join(str(tok['val']) for tok in cond_toks)
+                raise SyntaxError(
+                    f"while loop requires a delay: use while({cond_str}, ms) — "
+                    f"e.g. while({cond_str}, 100). "
+                    f"A delay prevents the app from freezing."
+                )
             self.eat('RPAREN')
             body = self._block()
             import time as _time

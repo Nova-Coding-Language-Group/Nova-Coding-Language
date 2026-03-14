@@ -918,7 +918,7 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
     A = emitter.assembly
 
     # Pre-pass: scan for all variable assignments and register field TYPES only
-    # (no cctor emissions — the main compiler handles initialization).
+    # (no cctor emissions, the main compiler handles initialization).
     # This ensures that when a variable is first READ inside a handler before
     # being assigned, the field type is already known so store() can coerce correctly.
     import re as _re
@@ -1352,6 +1352,13 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                         delay_ms = maybe_delay
                         inner = inner[:comma_idx].strip()
 
+                if delay_ms is None:
+                    raise SyntaxError(
+                        f"while loop requires a delay: use while({inner}, ms), "
+                        f"e.g. while({inner}, 100). "
+                        f"A delay prevents the app from freezing."
+                    )
+
                 if delay_ms and emitter.in_ui_window > 0:
                     # Inside a UI window — use WM_TIMER so the message pump stays alive
                     hname = "T_" + str(handler_counter[0]); handler_counter[0] += 1
@@ -1602,7 +1609,19 @@ class NovaCompilerApp:
         fname = self.listbox.get(sel[0])
         with open(os.path.join(self.src_dir.get(), fname), encoding="utf-8") as f: src = f.read()
         out_base = self.out_name.get().strip() or "NovaProgram"
-        emitter, read_paths = translate_nova_to_il(src, out_base)
+        self.log.delete("1.0", tk.END)
+        try:
+            emitter, read_paths = translate_nova_to_il(src, out_base)
+        except SyntaxError as e:
+            self.log.insert(tk.END, f"Syntax Error: {e}\n")
+            self.log.insert(tk.END, "Compilation aborted.\n")
+            self.log.see(tk.END)
+            return
+        except Exception as e:
+            self.log.insert(tk.END, f"Error: {e}\n")
+            self.log.insert(tk.END, "Compilation aborted.\n")
+            self.log.see(tk.END)
+            return
         self.last_il = emitter.get_il(emitter._main_lines)
         out_folder = os.path.abspath(self.src_dir.get())
         il_path = os.path.join(out_folder, out_base + ".il")

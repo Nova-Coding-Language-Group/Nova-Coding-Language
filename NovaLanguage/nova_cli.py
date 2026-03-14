@@ -64,16 +64,7 @@ def _was_double_clicked():
         # If detection fails, check if no args were passed
         return len(sys.argv) == 1
 
-def read_version():
-    base = sys._MEIPASS if hasattr(sys, '_MEIPASS') else os.path.dirname(os.path.abspath(__file__))
-    pkg_path = os.path.join(base, "NovaVSCodeExtension", "package.json")
-    try:
-        with open(pkg_path, "r", encoding="utf-8") as f:
-            return json.load(f).get("version", "0.0.1")
-    except Exception:
-        return "0.1.0-dev"
-
-VERSION = read_version()
+VERSION = "1.2.1"
 
 HELP_TEXT = f"""Nova v{VERSION} - Nova Language CLI
 
@@ -92,9 +83,9 @@ Usage:
 def print_logo():
     print(rf"""
     _   _
-   | \ | | ___ __   ____ _  |
-   |  \| |/ _ \\ \ / / _` | |
-   | |\  | (_) |\ V / (_| | |
+   | \ | | ___ __   ____ _  
+   |  \| |/ _ \\ \ / / _` | 
+   | |\  | (_) |\ V / (_| | 
    |_| \_|\___/  \_/ \__,_| v{VERSION}
     """)
 
