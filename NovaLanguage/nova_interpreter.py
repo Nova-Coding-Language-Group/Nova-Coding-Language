@@ -47,7 +47,8 @@ STATEMENTS
   inline blocks        when(x){put(1)}otherwise{put(0)}  on one line
 """
 
-import re, sys, os
+import re, sys, os, random as _random
+_rng = _random.Random()  # single persistent instance — never re-seeded
 
 
 
@@ -313,6 +314,23 @@ class NovaInterpreter:
         if t['type'] == 'ID' and t['val'] == 'break':
             self.eat(); raise BreakSignal()
 
+        if t['type'] == 'ID' and t['val'] == 'pause':
+            self.eat()
+            if self.match('LPAREN'):
+                self.eat('LPAREN')
+                if self.match('RPAREN'):
+                    # pause() with no arg — wait for Enter
+                    self.eat('RPAREN')
+                    input()
+                else:
+                    import time as _time
+                    ms = self.expression()
+                    self.eat('RPAREN')
+                    _time.sleep(float(ms) / 1000.0)
+            else:
+                input()
+            return
+
         if t['type'] == 'ID' and t['val'] == 'put':
             self.eat(); self.eat('LPAREN')
             self._out(self._display(self.expression()))
@@ -390,12 +408,26 @@ class NovaInterpreter:
 
         if t['type'] == 'ID' and t['val'] == 'while':
             self.eat(); self.eat('LPAREN')
-            cond_toks = self._collect_until('RPAREN'); self.eat('RPAREN')
+            cond_toks = self._collect_until('RPAREN')
+            # check for optional delay: while(cond, ms)
+            delay_ms = None
+            # scan cond_toks for a trailing comma + integer
+            for i in range(len(cond_toks) - 1, -1, -1):
+                if cond_toks[i]['type'] == 'COMMA':
+                    maybe = cond_toks[i+1:]
+                    if len(maybe) == 1 and maybe[0]['type'] == 'INT':
+                        delay_ms = int(maybe[0]['val'])
+                        cond_toks = cond_toks[:i]
+                    break
+            self.eat('RPAREN')
             body = self._block()
+            import time as _time
             while True:
                 if not self._truthy(self._eval_tokens(cond_toks)): break
                 try: self._exec_block(body)
                 except BreakSignal: break
+                if delay_ms is not None:
+                    _time.sleep(delay_ms / 1000.0)
             return
 
         if t['type'] == 'ID' and t['val'] == 'repeat':
@@ -551,6 +583,106 @@ class NovaInterpreter:
                     return abs(v) if isinstance(v, (int, float)) else v
                 if name == 'max':
                     a, b = _arg2(); _close(); return max(a, b)
+                if name == 'cpu':
+                    _close()
+                    try:
+                        import psutil
+                        return 'CPU: {:.1f}%'.format(psutil.cpu_percent(interval=0.1))
+                    except ImportError:
+                        return 'CPU: N/A (pip install psutil)'
+                if name == 'ram':
+                    _close()
+                    try:
+                        import psutil
+                        m = psutil.virtual_memory()
+                        used  = m.used  / 1073741824
+                        total = m.total / 1073741824
+                        return 'RAM: {:.1f} GB / {:.1f} GB ({:.0f}%)'.format(used, total, m.percent)
+                    except ImportError:
+                        return 'RAM: N/A (pip install psutil)'
+                if name == 'gpu':
+                    _close()
+                    try:
+                        import subprocess, re as _re
+                        out = subprocess.check_output(
+                            ['nvidia-smi', '--query-gpu=utilization.gpu',
+                             '--format=csv,noheader,nounits'],
+                            stderr=subprocess.DEVNULL).decode().strip()
+                        return 'GPU: {}%'.format(out.split('\n')[0].strip())
+                    except Exception:
+                        return 'GPU: N/A'
+                if name == 'gpu_val':
+                    _close()
+                    try:
+                        import subprocess
+                        out = subprocess.check_output(
+                            ['nvidia-smi', '--query-gpu=utilization.gpu',
+                             '--format=csv,noheader,nounits'],
+                            stderr=subprocess.DEVNULL).decode().strip()
+                        return float(out.split('\n')[0].strip())
+                    except Exception:
+                        return -1.0
+                if name == 'cpu_val':
+                    _close()
+                    try:
+                        import psutil
+                        return float(psutil.cpu_percent(interval=0.1))
+                    except ImportError:
+                        return -1.0
+                if name == 'ram_used':
+                    _close()
+                    try:
+                        import psutil
+                        return psutil.virtual_memory().used / 1073741824
+                    except ImportError:
+                        return -1.0
+                if name == 'ram_total':
+                    _close()
+                    try:
+                        import psutil
+                        return psutil.virtual_memory().total / 1073741824
+                    except ImportError:
+                        return -1.0
+                if name == 'all_pc':
+                    _close()
+                    try:
+                        import psutil
+                        c = psutil.cpu_percent(interval=0.1)
+                        m = psutil.virtual_memory()
+                        used  = m.used  / 1073741824
+                        total = m.total / 1073741824
+                        cpu_s = 'CPU: {:.1f}%'.format(c)
+                        ram_s = 'RAM: {:.1f}/{:.1f} GB'.format(used, total)
+                        return '{} | {} | GPU: N/A'.format(cpu_s, ram_s)
+                    except ImportError:
+                        return 'N/A (pip install psutil)'
+                if name == 'rand':
+                    # Peek: is it range form rand(lo - hi)?
+                    # Tokens at current pos would be: INT/FLOAT, OP(-), INT/FLOAT, RPAREN
+                    saved = self.pos
+                    try:
+                        t1 = self.peek(0)
+                        t2 = self.peek(1)
+                        t3 = self.peek(2)
+                        t4 = self.peek(3)
+                        if (t1 and t1['type'] in ('INT','FLOAT') and
+                            t2 and t2['type'] == 'OP' and t2['val'] == '-' and
+                            t3 and t3['type'] in ('INT','FLOAT') and
+                            t4 and t4['type'] == 'RPAREN'):
+                            lo = int(self.eat()['val'])
+                            self.eat('OP', '-')
+                            hi = int(self.eat()['val'])
+                            _close()
+                            return _rng.randint(lo, hi)
+                    except Exception:
+                        self.pos = saved
+                    # pick-list form: rand(a, b, c, ...)
+                    choices = []
+                    while not self.match('RPAREN') and self.peek():
+                        choices.append(_arg())
+                        if self.match('COMMA'): self.eat()
+                    _close()
+                    return _rng.choice(choices) if choices else 0
                 if name == 'min':
                     a, b = _arg2(); _close(); return min(a, b)
                 if name == 'type':

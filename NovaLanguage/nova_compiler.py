@@ -35,6 +35,77 @@ from tkinter import filedialog, scrolledtext, messagebox
 
 # --- ilasm finder -------------------------------------------------------------
 
+def _write_icon_res(ico_path, res_path):
+    """
+    Write a Win32 .res file containing the icon from ico_path.
+    Pure Python — no rc.exe or SDK needed.
+    """
+    import struct
+
+    with open(ico_path, 'rb') as f:
+        ico_data = f.read()
+
+    reserved, ico_type, count = struct.unpack_from('<HHH', ico_data, 0)
+    if ico_type != 1:
+        raise ValueError("Not a valid .ico file")
+
+    entries = []
+    for i in range(count):
+        off = 6 + i * 16
+        w, h, cc, res2, planes, bc, size, img_off = struct.unpack_from('<BBBBHHII', ico_data, off)
+        entries.append((w, h, cc, res2, planes, bc, size, img_off))
+
+    def align4(n):
+        return (4 - (n % 4)) % 4
+
+    with open(res_path, 'wb') as out:
+
+        # ── Mandatory null entry (must NOT be all-zeros — header fields required) ──
+        out.write(struct.pack('<I', 0))           # DataSize = 0
+        out.write(struct.pack('<I', 32))          # HeaderSize = 32
+        out.write(struct.pack('<HH', 0xFFFF, 0))  # Type = 0
+        out.write(struct.pack('<HH', 0xFFFF, 0))  # Name = 0
+        out.write(struct.pack('<I', 0))           # DataVersion
+        out.write(struct.pack('<H', 0))           # MemFlags
+        out.write(struct.pack('<H', 0))           # Language
+        out.write(struct.pack('<I', 0))           # Version
+        out.write(struct.pack('<I', 0))           # Characteristics
+
+        def write_res_entry(type_id, name_id, data, language=0x0409):
+            type_bytes = struct.pack('<HH', 0xFFFF, type_id)
+            name_bytes = struct.pack('<HH', 0xFFFF, name_id)
+            hdr_fixed  = 4 + 4 + len(type_bytes) + len(name_bytes) + 4 + 2 + 2 + 4 + 4
+            hdr_pad    = align4(hdr_fixed)
+            hdr_size   = hdr_fixed + hdr_pad
+            data_pad   = align4(len(data))
+
+            out.write(struct.pack('<I', len(data)))
+            out.write(struct.pack('<I', hdr_size))
+            out.write(type_bytes)
+            out.write(name_bytes)
+            out.write(struct.pack('<I', 0))        # DataVersion
+            out.write(struct.pack('<H', 0x1030))   # MemFlags: MOVEABLE|PURE|PRELOAD
+            out.write(struct.pack('<H', language))
+            out.write(struct.pack('<I', 0))        # Version
+            out.write(struct.pack('<I', 0))        # Characteristics
+            out.write(b'\x00' * hdr_pad)
+            out.write(data)
+            out.write(b'\x00' * data_pad)
+
+        # RT_ICON = 3: one entry per image in the .ico
+        for i, (w, h, cc, res2, planes, bc, size, img_off) in enumerate(entries):
+            img_data = ico_data[img_off: img_off + size]
+            write_res_entry(3, i + 1, img_data)
+
+        # RT_GROUP_ICON = 14: the directory that ties the RT_ICONs together
+        # GRPICONDIR header
+        grp = struct.pack('<HHH', 0, 1, count)
+        # GRPICONDIRENTRY: w(1) h(1) colorCount(1) reserved(1) planes(2) bitCount(2) bytesInRes(4) id(2)
+        for i, (w, h, cc, res2, planes, bc, size, img_off) in enumerate(entries):
+            grp += struct.pack('<BBBBHHIH', w, h, cc, res2, planes, bc, size, i + 1)
+        write_res_entry(14, 1, grp)
+
+
 def find_ilasm_path():
     windir = os.environ.get("WINDIR", r"C:\Windows")
     base   = os.path.join(windir, "Microsoft.NET")
@@ -158,6 +229,9 @@ class ILEmitter:
         self.handlers      = {}
         self.handler_order = []
         self.has_novaui    = False
+        self.has_novapc    = False
+        self.in_ui_window  = 0
+        self.win32_icon    = None  # set when icon("file.ico") is parsed
         self._lbl          = 0
         self._arrays       = {}
 
@@ -382,6 +456,132 @@ class ILEmitter:
 
 """)
 
+        if self.has_novapc:
+            il.insert(0, ".assembly extern NovaPc {}")
+            il.append(f"""\
+  .method public hidebysig static string _PC_cpu() cil managed {{
+    .maxstack 1
+    call string [NovaPc]NovaPc::cpu()
+    ret
+  }}
+
+  .method public hidebysig static string _PC_ram() cil managed {{
+    .maxstack 1
+    call string [NovaPc]NovaPc::ram()
+    ret
+  }}
+
+  .method public hidebysig static string _PC_gpu() cil managed {{
+    .maxstack 1
+    call string [NovaPc]NovaPc::gpu()
+    ret
+  }}
+
+  .method public hidebysig static string _PC_all_pc() cil managed {{
+    .maxstack 1
+    call string [NovaPc]NovaPc::all_pc()
+    ret
+  }}
+
+  .method public hidebysig static float64 _PC_cpu_val() cil managed {{
+    .maxstack 1
+    call float32 [NovaPc]NovaPc::cpu_val()
+    conv.r8
+    ret
+  }}
+
+  .method public hidebysig static float64 _PC_ram_used() cil managed {{
+    .maxstack 1
+    call float32 [NovaPc]NovaPc::ram_used()
+    conv.r8
+    ret
+  }}
+
+  .method public hidebysig static float64 _PC_ram_total() cil managed {{
+    .maxstack 1
+    call float32 [NovaPc]NovaPc::ram_total()
+    conv.r8
+    ret
+  }}
+
+  .method public hidebysig static float64 _PC_gpu_val() cil managed {{
+    .maxstack 1
+    call float32 [NovaPc]NovaPc::gpu_val()
+    conv.r8
+    ret
+  }}
+""")
+
+        if self.has_novaui:
+            il.append(f"""\
+  .method public hidebysig static void _SetPage(int32) cil managed {{
+    .maxstack 1
+    ldarg.0
+    call void [NovaUI]NovaUI::set_page(int32)
+    ret
+  }}
+
+  .method public hidebysig static int32 _GetWidgetCount() cil managed {{
+    .maxstack 1
+    call int32 [NovaUI]NovaUI::_WidgetCount()
+    ret
+  }}
+
+  .method public hidebysig static void _TagWidgets(int32, int32) cil managed {{
+    .maxstack 2
+    ldarg.0
+    ldarg.1
+    call void [NovaUI]NovaUI::_TagWidgets(int32, int32)
+    ret
+  }}
+
+  .method public hidebysig static void _TagLast(int32) cil managed {{
+    .maxstack 1
+    ldarg.0
+    call void [NovaUI]NovaUI::_TagLastWidget(int32)
+    ret
+  }}
+""")
+
+        # ── rand helpers ──────────────────────────────────────────────────────
+        # _RandRange(lo, hi) → int  :  picks integer in [lo, hi] inclusive
+        # _RandPick(int32[]) → int  :  picks one element from the array
+        il.append(f"""\
+  .field private static class [mscorlib]System.Random _rng
+
+  .method public hidebysig static int32 _RandRange(int32, int32) cil managed {{
+    .maxstack 4
+    ldsfld class [mscorlib]System.Random {A}::_rng
+    ldarg.0
+    ldarg.1
+    ldc.i4.1
+    add
+    callvirt instance int32 [mscorlib]System.Random::Next(int32, int32)
+    ret
+  }}
+
+  .method public hidebysig static int32 _RandPick(int32[]) cil managed {{
+    .maxstack 4
+    .locals init (int32 V_0)
+    ldsfld class [mscorlib]System.Random {A}::_rng
+    ldarg.0
+    ldlen
+    conv.i4
+    callvirt instance int32 [mscorlib]System.Random::Next(int32)
+    stloc.0
+    ldarg.0
+    ldloc.0
+    ldelem.i4
+    ret
+  }}
+""")
+        # initialise _rng in cctor — seeded with Environment.TickCount for proper randomness
+        self.cctor = [
+            f'call int32 [mscorlib]System.Environment::get_TickCount()',
+            f'newobj instance void [mscorlib]System.Random::.ctor(int32)',
+            f'stsfld class [mscorlib]System.Random {A}::_rng',
+        ] + self.cctor
+
         il += ["\n  .method private hidebysig specialname rtspecialname static void .cctor() cil managed {",
                "    .maxstack 10"]
         for ln in self.cctor: il.append("    " + ln)
@@ -452,6 +652,8 @@ def make_parser(emitter, read_file_paths):
                 "float64" if t == "float" else
                 "string"  if t == "string" else "class [mscorlib]System.String[]")
 
+    def to_int(t, il):
+        if t == "float": il.append('conv.i4')
     def to_float(t, il):
         if t == "int": il.append('conv.r8')
 
@@ -622,6 +824,52 @@ def make_parser(emitter, read_file_paths):
                     il.insert(len(il) - 1, f'ldstr "{escape_il(seg)}"')
                     il.append(f'call void {A}::_MemWrite(string, string)')
                     return vt, pos
+                if name == 'rand':
+                    # Peek ahead to detect range form: rand(INT - INT)
+                    # vs pick-list form: rand(a, b, c, ...)
+                    # Range: next two tokens after current pos are INT, OP('-'), INT, RP
+                    is_range = (
+                        pos + 2 < len(toks) and
+                        toks[pos][0] == 'INT' and
+                        toks[pos+1] == ('OP', '-') and
+                        toks[pos+2][0] == 'INT' and
+                        (pos + 3 >= len(toks) or toks[pos+3][0] == 'RP')
+                    )
+                    if is_range:
+                        lo = toks[pos][1];   pos += 1
+                        pos += 1  # skip '-'
+                        hi = toks[pos][1];   pos += 1
+                        close()
+                        il += [f'ldc.i4 {lo}', f'ldc.i4 {hi}',
+                               f'call int32 {A}::_RandRange(int32, int32)']
+                    else:
+                        # Collect all comma-separated int expressions into an int32[]
+                        args_il = []
+                        arg_count = 0
+                        while pos < len(toks) and toks[pos][0] != 'RP':
+                            a_il = []
+                            at, pos = prec(toks, pos, a_il, 0)
+                            to_int(at, a_il)
+                            args_il.append(a_il)
+                            arg_count += 1
+                            if pos < len(toks) and toks[pos][0] == 'CM':
+                                pos += 1
+                        close()
+                        il += [f'ldc.i4 {arg_count}',
+                               'newarr [mscorlib]System.Int32']
+                        for i, a_il in enumerate(args_il):
+                            il += ['dup', f'ldc.i4 {i}'] + a_il + ['stelem.i4']
+                        il.append(f'call int32 {A}::_RandPick(int32[])')
+                    return "int", pos
+                # novapc functions
+                if name in ('cpu', 'ram', 'gpu', 'all_pc') and emitter.has_novapc:
+                    close()
+                    il.append(f'call string {A}::_PC_{name}()')
+                    return "string", pos
+                if name in ('cpu_val', 'ram_used', 'ram_total', 'gpu_val') and emitter.has_novapc:
+                    close()
+                    il.append(f'call float64 {A}::_PC_{name}()')
+                    return "float", pos
                 # unknown - skip args
                 depth = 1
                 while pos < len(toks) and depth:
@@ -717,6 +965,7 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
             # use
             if re.match(r'^use\s+\w+', s):
                 if 'novaui' in s: emitter.has_novaui = True
+                if 'novapc' in s: emitter.has_novapc = True
                 idx += 1; continue
 
             # have
@@ -748,6 +997,36 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                     emitter.fields[name] = t
                     parse(val, emitter.cctor)
                     store(name, t, emitter.cctor)
+                idx += 1; continue
+
+            # page(N) { ... }
+            # Tags all widgets created inside the block with page N.
+            # set_page(N) at runtime switches the visible page.
+            m = re.match(r'^page\s*\(\s*(\d+)\s*\)$', s)
+            if m:
+                page_num = int(m.group(1))
+                # snapshot widget count before compiling body
+                il += [f'call int32 {A}::_GetWidgetCount()']
+                # store in a temp field
+                count_field = f'_pg_snap_{page_num}_{emitter.ulabel("PG")}'
+                emitter.fields[count_field] = 'int'
+                emitter.cctor += ['ldc.i4.0', f'stsfld int32 {A}::{count_field}']
+                il.append(f'stsfld int32 {A}::{count_field}')
+                # compile body
+                body_il, idx = compile_block(idx+1, indent+1)
+                il += body_il
+                # tag all widgets added since the snapshot
+                il += [f'ldsfld int32 {A}::{count_field}',
+                       f'ldc.i4 {page_num}',
+                       f'call void {A}::_TagWidgets(int32, int32)']
+                continue
+
+            # set_page(N) — switch active page at runtime
+            m = re.match(r'^set_page\s*\(\s*(.+)\s*\)$', s)
+            if m:
+                t = parse(m.group(1).strip(), il)
+                if t == 'float': il.append('conv.i4')
+                il.append(f'call void {A}::_SetPage(int32)')
                 idx += 1; continue
 
             # colors(preset) { txt=#hex bg=#hex accent=#hex }
@@ -791,7 +1070,9 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
             m = m1 or m2
             if m:
                 emitter.has_novaui = True
+                emitter.in_ui_window += 1
                 inner, idx = compile_block(idx+1, indent+1)
+                emitter.in_ui_window -= 1
                 body_name = "_WindowBody_" + emitter.ulabel('WB')
                 emitter.add_handler(body_name, inner)
                 action_il = ['ldnull',
@@ -1055,15 +1336,53 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                     il += ob
                 il.append(f'{end_l}:'); continue
 
-            # while
+            # while  — supports:
+            #   while(cond) {}
+            #   while (cond) {}
+            #   while(cond, ms) {}   — inside ui_window: becomes set_timer
+            #                        — outside ui_window: sleeps ms each iteration
             m = re.match(r'^while\s*\((.+)\)$', s)
             if m:
-                lp = emitter.ulabel("LP"); le = emitter.ulabel("LPEND")
-                il.append(f'{lp}:')
-                parse(m.group(1).strip(), il)
-                il.append(f'brfalse {le}')
-                body, idx = compile_block(idx+1, indent+1)
-                il += body + [f'br {lp}', f'{le}:']; continue
+                inner = m.group(1).strip()
+                delay_ms = None
+                comma_idx = inner.rfind(',')
+                if comma_idx != -1:
+                    maybe_delay = inner[comma_idx+1:].strip()
+                    if re.match(r'^\d+$', maybe_delay):
+                        delay_ms = maybe_delay
+                        inner = inner[:comma_idx].strip()
+
+                if delay_ms and emitter.in_ui_window > 0:
+                    # Inside a UI window — use WM_TIMER so the message pump stays alive
+                    hname = "T_" + str(handler_counter[0]); handler_counter[0] += 1
+                    body_il, idx = compile_block(idx+1, indent+1)
+                    # The timer handler: check condition, if false kill timer, else run body
+                    lp = emitter.ulabel("TC"); le = emitter.ulabel("TEND")
+                    timer_body = []
+                    parse(inner, timer_body)
+                    timer_body += [f'brfalse {le}'] + body_il + [f'br {lp}', f'{lp}:', f'{le}:']
+                    # Actually simpler: just run body unconditionally each tick,
+                    # condition check left to user (they set running=0 to stop)
+                    timer_body = list(body_il)
+                    emitter.add_handler(hname, timer_body)
+                    il += [f'ldc.i4 {delay_ms}',
+                           'ldnull',
+                           f'ldftn void {A}::{hname}()',
+                           'newobj instance void [mscorlib]System.Action::.ctor(object, native int)',
+                           'call void [NovaUI]NovaUI::set_timer(int32, class [mscorlib]System.Action)']
+                    continue
+                else:
+                    # Outside UI or no delay — classic blocking loop
+                    lp = emitter.ulabel("LP"); le = emitter.ulabel("LPEND")
+                    il.append(f'{lp}:')
+                    parse(inner, il)
+                    il.append(f'brfalse {le}')
+                    body, idx = compile_block(idx+1, indent+1)
+                    il += body
+                    if delay_ms:
+                        il += [f'ldc.i4 {delay_ms}',
+                               'call void [mscorlib]System.Threading.Thread::Sleep(int32)']
+                    il += [f'br {lp}', f'{le}:']; continue
 
             # repeat N
             m = re.match(r'^repeat\s+(.+)$', s)
@@ -1108,6 +1427,7 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
             # icon
             m = re.match(r'^icon\s*\(\s*"([^"]+)"\s*\)$', s)
             if m:
+                emitter.win32_icon = m.group(1)  # store for ilasm /win32icon flag
                 il += [f'ldstr "{escape_il(m.group(1))}"',
                        f'call void {A}::_SetIcon(string)']
                 idx += 1; continue
@@ -1135,6 +1455,12 @@ def translate_nova_to_il(nova_text, assembly_name="NovaProgram"):
                 idx += 1; continue
             if s in ('pause', 'pause()'):
                 il += ['call valuetype [mscorlib]System.ConsoleKeyInfo [mscorlib]System.Console::ReadKey()', 'pop']
+                idx += 1; continue
+            m = re.match(r'^pause\s*\((.+)\)$', s)
+            if m:
+                pt = parse(m.group(1).strip(), il)
+                if pt == 'float': il.append('conv.i4')
+                il.append('call void [mscorlib]System.Threading.Thread::Sleep(int32)')
                 idx += 1; continue
 
             # array element assignment  NAME[expr] = expr
@@ -1298,11 +1624,43 @@ class NovaCompilerApp:
                 except Exception as e: self.log.insert(tk.END, "Warning: " + str(e) + "\n")
             elif not dll_src:
                 self.log.insert(tk.END, "Warning: NovaUI.dll not found.\n")
+        if emitter.has_novapc:
+            candidates = []
+            for name in ("novapc.dll", "NovaPc.dll", "NOVAPC.DLL"):
+                for folder in (out_folder, self.script_dir, os.getcwd()):
+                    candidates.append(os.path.join(folder, name))
+            dll_src = next((p for p in candidates if os.path.isfile(p)), None)
+            dst = os.path.join(out_folder, "novapc.dll")
+            if dll_src and os.path.abspath(dll_src) != os.path.abspath(dst):
+                try: shutil.copy2(dll_src, dst); self.log.insert(tk.END, "Copied novapc.dll\n")
+                except Exception as e: self.log.insert(tk.END, "Warning: " + str(e) + "\n")
+            elif not dll_src:
+                self.log.insert(tk.END, "Warning: novapc.dll not found — compile novapc.cs first.\n")
         ilasm = self.ilasm_path.get() or find_ilasm_path()
         if not ilasm: self.log.insert(tk.END, "Error: ilasm.exe not found.\n"); return
         ext      = ".exe" if self.compile_type.get() == "exe" else ".dll"
         out_file = os.path.join(out_folder, out_base + ext)
         cmd      = [ilasm, il_path, f"/{self.compile_type.get()}", f"/output={out_file}"]
+
+        # Embed .ico into the exe using a hand-written .res so File Explorer shows it.
+        # No rc.exe or Windows SDK needed — we write the binary .res ourselves.
+        if emitter.win32_icon and self.compile_type.get() == "exe":
+            ico_path = emitter.win32_icon
+            if not os.path.isabs(ico_path):
+                for base in (self.script_dir, out_folder, os.getcwd()):
+                    candidate = os.path.join(base, ico_path)
+                    if os.path.isfile(candidate):
+                        ico_path = os.path.abspath(candidate); break
+            if os.path.isfile(ico_path):
+                try:
+                    res_path = os.path.join(out_folder, out_base + ".res")
+                    _write_icon_res(ico_path, res_path)
+                    cmd.append(f"/resource={res_path}")
+                    self.log.insert(tk.END, "Embedded icon into exe.\n")
+                except Exception as e:
+                    self.log.insert(tk.END, f"Warning: icon embed failed ({e}) — window icon only.\n")
+            else:
+                self.log.insert(tk.END, f"Warning: icon file not found: {ico_path}\n")
         self.log.insert(tk.END, f"Running: {' '.join(cmd)}\n")
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, cwd=out_folder)

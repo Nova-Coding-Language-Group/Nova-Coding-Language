@@ -177,7 +177,7 @@ def compile_file(path, out_type="exe"):
 def main():
     args = sys.argv[1:]
 
-    # No args — check if double-clicked or typed "Nova" in terminal
+    # No args - check if double-clicked or typed "Nova" in terminal
     if not args:
         if _was_double_clicked():
             open_compiler()
